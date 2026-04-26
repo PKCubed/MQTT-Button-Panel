@@ -6,28 +6,33 @@
 #include "driver/rmt.h"
 #include "driver/touch_pad.h"
 #include "esp_eth.h"
+#include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_netif_defaults.h"
-#include "esp_rom_sys.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 #include "nvs_flash.h"
 
+#include "esp_http_server.h"
+#include "nvs.h"
+
+#include "mqtt_client.h"
+static esp_mqtt_client_handle_t s_mqtt_client = NULL;
+
 #define ARRAY_LEN(x) (sizeof(x) / sizeof((x)[0]))
+static const char *TAG = "panel_main";
 
-static const char *TAG = "hw_test";
-
-/* WT32-ETH01 ethernet defaults. */
+/* --- Hardware Definitions (from your test code) --- */
 #define ETH_PHY_ADDR 1
 #define ETH_PHY_RST_GPIO -1
 #define ETH_MDC_GPIO 23
 #define ETH_MDIO_GPIO 18
 #define ETH_PHY_POWER_GPIO 16
 
-/* Shared I2C bus for both PCF8574 chips. */
 #define I2C_PORT I2C_NUM_0
 #define I2C_SDA GPIO_NUM_14
 #define I2C_SCL GPIO_NUM_5
@@ -36,27 +41,19 @@ static const char *TAG = "hw_test";
 #define PCF_LCD_ADDR 0x27
 #define PCF_BUTTON_ADDR 0x26
 
-/* LCD backpack bit mapping for common PCF8574 boards. */
 #define LCD_PIN_EN 0x04
 #define LCD_PIN_RW 0x02
 #define LCD_PIN_RS 0x01
 #define LCD_PIN_BL 0x08
 
-/* Old firmware used 6 buttons on PCF8574 pins below (active low). */
 #define BUTTON_COUNT 6
 static const uint8_t k_button_pcf_bits[BUTTON_COUNT] = {5, 4, 3, 2, 1, 0};
 
-/* Capacitive rings from old firmware mapping. */
 static const touch_pad_t k_touch_channels[BUTTON_COUNT] = {
-    TOUCH_PAD_NUM0, /* GPIO4  */
-    TOUCH_PAD_NUM3, /* GPIO15 */
-    TOUCH_PAD_NUM2, /* GPIO2  */
-    TOUCH_PAD_NUM5, /* GPIO12 */
-    TOUCH_PAD_NUM9, /* GPIO32 */
-    TOUCH_PAD_NUM8, /* GPIO33 */
+    TOUCH_PAD_NUM0, TOUCH_PAD_NUM3, TOUCH_PAD_NUM2, 
+    TOUCH_PAD_NUM5, TOUCH_PAD_NUM9, TOUCH_PAD_NUM8,
 };
 
-/* WS2812 chain from old firmware. */
 #define LED_COUNT 6
 #define LED_PIN GPIO_NUM_17
 #define WS2812_RMT_CHANNEL RMT_CHANNEL_0
@@ -66,6 +63,69 @@ static const touch_pad_t k_touch_channels[BUTTON_COUNT] = {
 #define WS2812_T1H_TICKS 28
 #define WS2812_T1L_TICKS 24
 #define WS2812_RESET_TICKS 2400
+
+/* --- System Configuration Structures --- */
+#define MAX_BANKS 4
+#define MAIN_BTN_COUNT 4
+#define BTN_BANK_DOWN 4
+#define BTN_BANK_UP 5
+
+typedef enum { BTN_TYPE_TOGGLE, BTN_TYPE_MOMENTARY, BTN_TYPE_RADIO } btn_type_t;
+
+typedef struct {
+    char display_name[17];
+    char mqtt_topic[64];
+    btn_type_t type;
+    uint8_t color_on[3];  // GRB
+    uint8_t color_off[3]; // GRB
+    uint8_t radio_group;  // 0 means no group
+} button_config_t;
+
+typedef struct {
+    char bank_name[17];
+    button_config_t buttons[MAIN_BTN_COUNT];
+} bank_config_t;
+
+typedef struct {
+    char panel_name[17];
+    uint8_t num_banks;
+    bank_config_t banks[MAX_BANKS];
+} system_config_t;
+
+typedef struct {
+    char broker_ip[32];
+    char port[8];      // Kept as string for easier HTML form parsing
+    char username[32];
+    char password[64];
+} mqtt_config_t;
+
+// Add this alongside your other static variables
+static mqtt_config_t s_mqtt_config = {
+    .broker_ip = "192.168.1.100",
+    .port = "1883",
+    .username = "",
+    .password = ""
+};
+
+/* --- Global State --- */
+static system_config_t s_config;
+static uint8_t s_current_bank = 0;
+static bool s_btn_states[MAX_BANKS][MAIN_BTN_COUNT] = {false}; // Logical states (ON/OFF)
+static bool s_in_menu = false;
+
+// Network status
+static bool s_eth_connected = false;
+static bool s_wifi_connected = false;
+
+// Queues for inter-task communication
+static QueueHandle_t s_btn_event_queue;
+
+typedef enum { EVT_BTN_PRESSED, EVT_BTN_RELEASED, EVT_TOUCH_START, EVT_TOUCH_END } event_type_t;
+typedef struct {
+    event_type_t type;
+    uint8_t btn_idx;
+} input_event_t;
+
 
 static rmt_item32_t s_led_items[(LED_COUNT * 24) + 1];
 static bool s_eth_link = false;
@@ -80,6 +140,7 @@ static int64_t s_button_last_change_ms[BUTTON_COUNT] = {0};
 
 static char s_lcd_last_line1[17] = {0};
 static char s_lcd_last_line2[17] = {0};
+
 
 static int64_t now_ms(void)
 {
@@ -221,6 +282,20 @@ static esp_err_t lcd_set_lines(const char *line1, const char *line2)
     }
 
     return ESP_OK;
+}
+
+static esp_err_t i2c_init(void)
+{
+    i2c_config_t conf = {
+        .mode = I2C_MODE_MASTER,
+        .sda_io_num = I2C_SDA,
+        .sda_pullup_en = GPIO_PULLUP_ENABLE,
+        .scl_io_num = I2C_SCL,
+        .scl_pullup_en = GPIO_PULLUP_ENABLE,
+        .master.clk_speed = I2C_FREQ_HZ,
+    };
+    i2c_param_config(I2C_PORT, &conf);
+    return i2c_driver_install(I2C_PORT, conf.mode, 0, 0, 0);
 }
 
 static esp_err_t lcd_init(void)
@@ -399,231 +474,527 @@ static bool touch_is_active(size_t idx, uint16_t current)
     return current < threshold;
 }
 
-static void eth_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
-{
-    (void)arg;
-    (void)event_data;
 
-    if (event_base == ETH_EVENT) {
-        switch (event_id) {
-        case ETHERNET_EVENT_CONNECTED:
-            s_eth_link = true;
-            ESP_LOGI(TAG, "Ethernet link UP");
-            break;
-        case ETHERNET_EVENT_DISCONNECTED:
-            s_eth_link = false;
-            s_eth_has_ip = false;
-            ESP_LOGW(TAG, "Ethernet link DOWN");
-            break;
-        default:
-            break;
-        }
-    }
-
-    if (event_base == IP_EVENT && event_id == IP_EVENT_ETH_GOT_IP) {
-        ip_event_got_ip_t *evt = (ip_event_got_ip_t *)event_data;
-        s_eth_has_ip = true;
-        ESP_LOGI(TAG, "Ethernet IP: " IPSTR, IP2STR(&evt->ip_info.ip));
+static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data) {
+    esp_mqtt_event_handle_t event = event_data;
+    
+    if (event->event_id == MQTT_EVENT_CONNECTED) {
+        ESP_LOGI(TAG, "MQTT Connected to Broker!");
+        // We will add subscription logic here later for 2-way sync
+    } else if (event->event_id == MQTT_EVENT_DISCONNECTED) {
+        ESP_LOGW(TAG, "MQTT Disconnected from Broker");
     }
 }
 
-static esp_err_t ethernet_init(void)
-{
+static void start_mqtt(void) {
+    // Prevent starting multiple clients if network bounces
+    if (s_mqtt_client != NULL) {
+        esp_mqtt_client_destroy(s_mqtt_client);
+        s_mqtt_client = NULL;
+    }
+
+    // Don't try to connect if the web UI hasn't been configured yet
+    if (strlen(s_mqtt_config.broker_ip) == 0) {
+        ESP_LOGW(TAG, "No MQTT Broker IP configured. Skipping MQTT init.");
+        return;
+    }
+
+    char broker_uri[64];
+    snprintf(broker_uri, sizeof(broker_uri), "mqtt://%s:%s", s_mqtt_config.broker_ip, s_mqtt_config.port);
+    ESP_LOGI(TAG, "Starting MQTT Client to %s", broker_uri);
+
+    esp_mqtt_client_config_t mqtt_cfg = {
+        .broker.address.uri = broker_uri,
+        .credentials.username = strlen(s_mqtt_config.username) > 0 ? s_mqtt_config.username : NULL,
+        .credentials.authentication.password = strlen(s_mqtt_config.password) > 0 ? s_mqtt_config.password : NULL,
+    };
+
+    s_mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
+    esp_mqtt_client_register_event(s_mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
+    esp_mqtt_client_start(s_mqtt_client);
+}
+
+static void publish_mqtt_state(uint8_t bank, uint8_t btn, bool state) {
+    if (!s_mqtt_client) return; // Fail gracefully if not connected
+    
+    char pub_topic[80];
+    snprintf(pub_topic, sizeof(pub_topic), "%s/set", s_config.banks[bank].buttons[btn].mqtt_topic);
+    const char *payload = state ? "ON" : "OFF";
+    
+    // Publish with QoS 1
+    esp_mqtt_client_publish(s_mqtt_client, pub_topic, payload, 0, 1, 0);
+    ESP_LOGI(TAG, "MQTT PUB: %s -> %s", pub_topic, payload);
+}
+
+
+// Network Event Handler
+static void net_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data) {
+    if (event_base == ETH_EVENT) {
+        switch (event_id) {
+            case ETHERNET_EVENT_CONNECTED:
+                ESP_LOGI(TAG, "Ethernet Link Up");
+                s_eth_connected = true;
+                // Optional: Stop Wi-Fi to save power if ETH connects
+                esp_wifi_stop(); 
+                break;
+            case ETHERNET_EVENT_DISCONNECTED:
+                ESP_LOGI(TAG, "Ethernet Link Down - Starting Wi-Fi Fallback");
+                s_eth_connected = false;
+                esp_wifi_start();
+                esp_wifi_connect();
+                break;
+        }
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_ETH_GOT_IP) {
+        ip_event_got_ip_t *event = (ip_event_got_ip_t *) event_data;
+        ESP_LOGI(TAG, "ETH Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
+        s_eth_has_ip = true;
+        start_mqtt();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        if (!s_eth_connected) {
+            ESP_LOGI(TAG, "Wi-Fi Disconnected, retrying...");
+            esp_wifi_connect();
+        }
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *event = (ip_event_got_ip_t *) event_data;
+        s_eth_has_ip = true;
+        ESP_LOGI(TAG, "WIFI Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
+        s_wifi_connected = true;
+        start_mqtt();
+    }
+}
+
+// WT32-ETH01 Init (ESP-IDF v5.x compatible)
+static void init_network_failover(void) {
+    // 1. Power up the PHY and WAIT
     ESP_ERROR_CHECK(gpio_set_direction(ETH_PHY_POWER_GPIO, GPIO_MODE_OUTPUT));
     ESP_ERROR_CHECK(gpio_set_level(ETH_PHY_POWER_GPIO, 1));
+    vTaskDelay(pdMS_TO_TICKS(50)); // Crucial: Give LAN8720 time to boot up
 
+    esp_netif_config_t cfg = ESP_NETIF_DEFAULT_ETH();
+    esp_netif_t *eth_netif = esp_netif_new(&cfg);
+
+    eth_mac_config_t mac_config = ETH_MAC_DEFAULT_CONFIG();
     eth_esp32_emac_config_t esp32_emac_config = ETH_ESP32_EMAC_DEFAULT_CONFIG();
     esp32_emac_config.smi_gpio.mdc_num = ETH_MDC_GPIO;
     esp32_emac_config.smi_gpio.mdio_num = ETH_MDIO_GPIO;
+    
+    // 2. Configure WT32-ETH01 50MHz RMII Clock In
+    esp32_emac_config.clock_config.rmii.clock_mode = EMAC_CLK_EXT_IN;
+    esp32_emac_config.clock_config.rmii.clock_gpio = EMAC_CLK_IN_GPIO; // GPIO 0
+    
+    esp_eth_mac_t *mac = esp_eth_mac_new_esp32(&esp32_emac_config, &mac_config);
 
-    eth_mac_config_t mac_config = ETH_MAC_DEFAULT_CONFIG();
     eth_phy_config_t phy_config = ETH_PHY_DEFAULT_CONFIG();
     phy_config.phy_addr = ETH_PHY_ADDR;
     phy_config.reset_gpio_num = ETH_PHY_RST_GPIO;
-
-    esp_eth_mac_t *mac = esp_eth_mac_new_esp32(&esp32_emac_config, &mac_config);
-    if (!mac) {
-        return ESP_FAIL;
-    }
-
     esp_eth_phy_t *phy = esp_eth_phy_new_lan87xx(&phy_config);
-    if (!phy) {
-        return ESP_FAIL;
-    }
 
-    esp_eth_config_t config = ETH_DEFAULT_CONFIG(mac, phy);
+    esp_eth_config_t eth_config = ETH_DEFAULT_CONFIG(mac, phy);
     esp_eth_handle_t eth_handle = NULL;
-    ESP_ERROR_CHECK(esp_eth_driver_install(&config, &eth_handle));
+    ESP_ERROR_CHECK(esp_eth_driver_install(&eth_config, &eth_handle));
+    ESP_ERROR_CHECK(esp_netif_attach(eth_netif, esp_eth_new_netif_glue(eth_handle)));
 
-    esp_netif_config_t netif_cfg = ESP_NETIF_DEFAULT_ETH();
-    esp_netif_t *netif_eth = esp_netif_new(&netif_cfg);
-    if (!netif_eth) {
-        return ESP_FAIL;
-    }
+    // Initialize Wi-Fi (Fallback)
+    esp_netif_create_default_wifi_sta();
+    wifi_init_config_t wifi_cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&wifi_cfg));
+    
+    wifi_config_t sta_config = {
+        .sta = {
+            .ssid = "YOUR_SSID",     
+            .password = "YOUR_PASS", 
+        },
+    };
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_config));
 
-    esp_eth_netif_glue_handle_t glue = esp_eth_new_netif_glue(eth_handle);
-    ESP_ERROR_CHECK(esp_netif_attach(netif_eth, glue));
+    // Register Handlers
+    esp_event_handler_register(ETH_EVENT, ESP_EVENT_ANY_ID, &net_event_handler, NULL);
+    esp_event_handler_register(IP_EVENT, ESP_EVENT_ANY_ID, &net_event_handler, NULL);
+    esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &net_event_handler, NULL);
 
-    return esp_eth_start(eth_handle);
+    ESP_ERROR_CHECK(esp_eth_start(eth_handle));
 }
 
-static void update_lcd_status(const uint8_t debounced_pressed[BUTTON_COUNT], const bool touch_active[BUTTON_COUNT])
+/* ========================================================================== */
+/* Application Logic                                                          */
+/* ========================================================================== */
+
+static void save_settings_nvs(void)
 {
-    char line1[17];
-    char line2[17];
-
-    snprintf(line1, sizeof(line1), "B:%c%c%c%c%c%c E:%c", 
-             debounced_pressed[0] ? '1' : '-',
-             debounced_pressed[1] ? '2' : '-',
-             debounced_pressed[2] ? '3' : '-',
-             debounced_pressed[3] ? '4' : '-',
-             debounced_pressed[4] ? '5' : '-',
-             debounced_pressed[5] ? '6' : '-',
-             s_eth_link ? 'U' : 'D');
-
-    snprintf(line2, sizeof(line2), "T:%c%c%c%c%c%c IP:%c", 
-             touch_active[0] ? '1' : '-',
-             touch_active[1] ? '2' : '-',
-             touch_active[2] ? '3' : '-',
-             touch_active[3] ? '4' : '-',
-             touch_active[4] ? '5' : '-',
-             touch_active[5] ? '6' : '-',
-             s_eth_has_ip ? 'Y' : 'N');
-
-    if (lcd_set_lines(line1, line2) != ESP_OK) {
-        ESP_LOGW(TAG, "LCD update failed");
+    nvs_handle_t my_handle;
+    if (nvs_open("storage", NVS_READWRITE, &my_handle) == ESP_OK) {
+        nvs_set_str(my_handle, "mqtt_ip", s_mqtt_config.broker_ip);
+        nvs_set_str(my_handle, "mqtt_port", s_mqtt_config.port);
+        nvs_set_str(my_handle, "mqtt_user", s_mqtt_config.username);
+        nvs_set_str(my_handle, "mqtt_pass", s_mqtt_config.password);
+        nvs_commit(my_handle);
+        nvs_close(my_handle);
+        ESP_LOGI(TAG, "Settings saved to NVS");
     }
 }
 
-static void update_led_status(const uint8_t debounced_pressed[BUTTON_COUNT], const bool touch_active[BUTTON_COUNT])
+static void load_settings_nvs(void)
 {
+    nvs_handle_t my_handle;
+    if (nvs_open("storage", NVS_READONLY, &my_handle) == ESP_OK) {
+        size_t len;
+        
+        len = sizeof(s_mqtt_config.broker_ip);
+        nvs_get_str(my_handle, "mqtt_ip", s_mqtt_config.broker_ip, &len);
+        
+        len = sizeof(s_mqtt_config.port);
+        nvs_get_str(my_handle, "mqtt_port", s_mqtt_config.port, &len);
+        
+        len = sizeof(s_mqtt_config.username);
+        nvs_get_str(my_handle, "mqtt_user", s_mqtt_config.username, &len);
+        
+        len = sizeof(s_mqtt_config.password);
+        nvs_get_str(my_handle, "mqtt_pass", s_mqtt_config.password, &len);
+        
+        nvs_close(my_handle);
+        ESP_LOGI(TAG, "Settings loaded from NVS");
+    }
+}
+
+static void load_default_config(void)
+{
+    snprintf(s_config.panel_name, sizeof(s_config.panel_name), "Sanctuary Ltg");
+    s_config.num_banks = 2;
+    
+    snprintf(s_config.banks[0].bank_name, sizeof(s_config.banks[0].bank_name), "Worship Set");
+    for(int i = 0; i < 4; i++) {
+        snprintf(s_config.banks[0].buttons[i].display_name, 17, "Scene %d", i+1);
+        
+        // ADD THIS: Give the button a default MQTT topic!
+        snprintf(s_config.banks[0].buttons[i].mqtt_topic, 64, "sanctuary/worship/scene%d", i+1); 
+        
+        s_config.banks[0].buttons[i].type = BTN_TYPE_RADIO;
+        s_config.banks[0].buttons[i].radio_group = 1;
+        
+        // ... (Keep your existing color definitions here)
+        s_config.banks[0].buttons[i].color_on[0] = 0;   // R
+        s_config.banks[0].buttons[i].color_on[1] = 255; // G
+        s_config.banks[0].buttons[i].color_on[2] = 0;   // B
+        s_config.banks[0].buttons[i].color_off[0] = 255; // R
+        s_config.banks[0].buttons[i].color_off[1] = 0;   // G
+        s_config.banks[0].buttons[i].color_off[2] = 0;   // B
+    }
+
+    snprintf(s_config.banks[1].bank_name, sizeof(s_config.banks[1].bank_name), "House Lights");
+    for(int i = 0; i < 4; i++) {
+        snprintf(s_config.banks[1].buttons[i].display_name, 17, "Zone %d", i+1);
+        
+        // ADD THIS: Give the button a default MQTT topic!
+        snprintf(s_config.banks[1].buttons[i].mqtt_topic, 64, "sanctuary/house/zone%d", i+1);
+        
+        s_config.banks[1].buttons[i].type = BTN_TYPE_TOGGLE;
+        
+        // ... (Keep your existing color definitions here)
+        s_config.banks[1].buttons[i].color_on[0] = 0;   // R
+        s_config.banks[1].buttons[i].color_on[1] = 255; // G
+        s_config.banks[1].buttons[i].color_on[2] = 0;   // B
+        s_config.banks[1].buttons[i].color_off[0] = 255; // R
+        s_config.banks[1].buttons[i].color_off[1] = 0;   // G
+        s_config.banks[1].buttons[i].color_off[2] = 0;   // B
+    }
+}
+
+static void update_system_ui(int touch_preview_idx)
+{
+    char line1[32];
+    char line2[32];
+
+    // --- LCD Updates ---
+    if (s_in_menu) {
+        snprintf(line1, sizeof(line1), "--- MENU ---");
+        snprintf(line2, sizeof(line2), "Settings..."); 
+    } else if (touch_preview_idx >= 0 && touch_preview_idx < MAIN_BTN_COUNT) {
+        button_config_t *btn = &s_config.banks[s_current_bank].buttons[touch_preview_idx];
+        snprintf(line1, sizeof(line1), "Btn: %s", btn->display_name);
+        snprintf(line2, sizeof(line2), "Act: %s", s_btn_states[s_current_bank][touch_preview_idx] ? "ON" : "OFF");
+    } else {
+        snprintf(line1, sizeof(line1), "%s", s_config.banks[s_current_bank].bank_name);
+        snprintf(line2, sizeof(line2), "Net: %s", s_eth_has_ip ? "ONLINE" : "OFFLINE");
+    }
+    lcd_set_lines(line1, line2);
+
+    // --- LED Updates ---
     uint8_t rgb[LED_COUNT][3] = {0};
-
-    for (int i = 0; i < LED_COUNT; ++i) {
-        if (debounced_pressed[i]) {
-            rgb[i][0] = 0;
-            rgb[i][1] = 64;
-            rgb[i][2] = 0;
+    
+    for (int i = 0; i < MAIN_BTN_COUNT; i++) {
+        button_config_t *btn_cfg = &s_config.banks[s_current_bank].buttons[i];
+        bool is_on = s_btn_states[s_current_bank][i];
+        
+        if (is_on) {
+            memcpy(rgb[i], btn_cfg->color_on, 3);
         } else {
-            rgb[i][0] = 32;
-            rgb[i][1] = 0;
-            rgb[i][2] = 0;
+            memcpy(rgb[i], btn_cfg->color_off, 3);
         }
-
-        if (touch_active[i]) {
-            rgb[i][0] = 0;
-            rgb[i][1] = 16;
-            rgb[i][2] = 64;
-        }
+        
+        // Removed the touch_preview_idx override block here
     }
 
-    if (ws2812_show(rgb) != ESP_OK) {
-        ESP_LOGW(TAG, "LED update failed");
+    // Increased Bank Up/Down static brightness to balance with max RGB
+    rgb[BTN_BANK_DOWN][0] = 64; rgb[BTN_BANK_DOWN][1] = 64; rgb[BTN_BANK_DOWN][2] = 64;
+    rgb[BTN_BANK_UP][0] = 64; rgb[BTN_BANK_UP][1] = 64; rgb[BTN_BANK_UP][2] = 64;
+
+    ws2812_show(rgb);
+}
+
+static void logic_task(void *arg)
+{
+    input_event_t evt;
+    int current_touch_preview = -1;
+    int64_t menu_timer_start = 0;
+    bool bank_btns_held[2] = {false, false};
+
+    update_system_ui(-1);
+
+    while (1) {
+        if (xQueueReceive(s_btn_event_queue, &evt, pdMS_TO_TICKS(50))) {
+            if (evt.btn_idx == BTN_BANK_DOWN || evt.btn_idx == BTN_BANK_UP) {
+                if (evt.type == EVT_BTN_PRESSED) {
+                    bank_btns_held[evt.btn_idx - BTN_BANK_DOWN] = true;
+                    if (bank_btns_held[0] && bank_btns_held[1]) {
+                        menu_timer_start = now_ms();
+                    }
+                } else if (evt.type == EVT_BTN_RELEASED) {
+                    bank_btns_held[evt.btn_idx - BTN_BANK_DOWN] = false;
+                    menu_timer_start = 0;
+
+                    if (!s_in_menu) {
+                        if (evt.btn_idx == BTN_BANK_UP && s_current_bank < s_config.num_banks - 1) s_current_bank++;
+                        if (evt.btn_idx == BTN_BANK_DOWN && s_current_bank > 0) s_current_bank--;
+                        update_system_ui(current_touch_preview);
+                    }
+                }
+            }
+
+            if (evt.type == EVT_TOUCH_START && evt.btn_idx < MAIN_BTN_COUNT) {
+                current_touch_preview = evt.btn_idx;
+                update_system_ui(current_touch_preview);
+            } else if (evt.type == EVT_TOUCH_END && evt.btn_idx == current_touch_preview) {
+                current_touch_preview = -1;
+                update_system_ui(current_touch_preview);
+            }
+
+            if (evt.btn_idx < MAIN_BTN_COUNT) {
+                if (s_in_menu) {
+                    if (evt.type == EVT_BTN_PRESSED && evt.btn_idx == 3) {
+                        s_in_menu = false;
+                        update_system_ui(-1);
+                    }
+                } else {
+                    button_config_t *cfg = &s_config.banks[s_current_bank].buttons[evt.btn_idx];
+                    bool *state = &s_btn_states[s_current_bank][evt.btn_idx];
+
+                    if (evt.type == EVT_BTN_PRESSED) {
+                        if (cfg->type == BTN_TYPE_TOGGLE) {
+                            *state = !(*state);
+                            publish_mqtt_state(s_current_bank, evt.btn_idx, *state);
+                        } 
+                        else if (cfg->type == BTN_TYPE_MOMENTARY) {
+                            *state = true;
+                            publish_mqtt_state(s_current_bank, evt.btn_idx, true);
+                        }
+                        else if (cfg->type == BTN_TYPE_RADIO) {
+                            for (int i = 0; i < MAIN_BTN_COUNT; i++) {
+                                if (s_config.banks[s_current_bank].buttons[i].radio_group == cfg->radio_group) {
+                                    s_btn_states[s_current_bank][i] = false;
+                                    publish_mqtt_state(s_current_bank, i, false);
+                                }
+                            }
+                            *state = true;
+                            publish_mqtt_state(s_current_bank, evt.btn_idx, true); 
+                        }
+                    } else if (evt.type == EVT_BTN_RELEASED) {
+                        if (cfg->type == BTN_TYPE_MOMENTARY) {
+                            *state = false;
+                            publish_mqtt_state(s_current_bank, evt.btn_idx, false);
+                        }
+                    }
+                    update_system_ui(current_touch_preview);
+                }
+            }
+        }
+
+        if (menu_timer_start > 0 && (now_ms() - menu_timer_start > 2000)) {
+            s_in_menu = !s_in_menu;
+            menu_timer_start = 0; 
+            update_system_ui(current_touch_preview);
+        }
     }
 }
 
-static void hardware_test_task(void *arg)
+static void hardware_task(void *arg)
 {
-    (void)arg;
-
-    uint8_t debounced_pressed[BUTTON_COUNT] = {0};
     uint16_t touch_values[BUTTON_COUNT] = {0};
-    bool touch_active[BUTTON_COUNT] = {false};
+    bool last_touch_state[BUTTON_COUNT] = {false};
 
     while (true) {
         uint8_t raw = 0xFF;
-        if (buttons_read_raw(&raw) != ESP_OK) {
-            ESP_LOGW(TAG, "Button expander read failed");
-            vTaskDelay(pdMS_TO_TICKS(100));
-            continue;
-        }
+        if (buttons_read_raw(&raw) == ESP_OK) {
+            s_button_state = raw;
+            for (int i = 0; i < BUTTON_COUNT; ++i) {
+                bool is_pressed = ((s_button_state >> k_button_pcf_bits[i]) & 0x01) == 0;
+                bool was_pressed = ((s_button_last_state >> k_button_pcf_bits[i]) & 0x01) == 0;
 
-        s_button_state = raw;
-
-        for (int i = 0; i < BUTTON_COUNT; ++i) {
-            bool is_pressed_now = ((s_button_state >> k_button_pcf_bits[i]) & 0x01) == 0;
-            bool was_pressed_last = ((s_button_last_state >> k_button_pcf_bits[i]) & 0x01) == 0;
-
-            if (is_pressed_now != was_pressed_last) {
-                s_button_last_change_ms[i] = now_ms();
+                if (is_pressed != was_pressed) {
+                    if ((now_ms() - s_button_last_change_ms[i]) > 25) { 
+                        input_event_t evt = {
+                            .type = is_pressed ? EVT_BTN_PRESSED : EVT_BTN_RELEASED,
+                            .btn_idx = i
+                        };
+                        xQueueSend(s_btn_event_queue, &evt, 0);
+                        s_button_last_change_ms[i] = now_ms();
+                    }
+                }
             }
-
-            if ((now_ms() - s_button_last_change_ms[i]) > 25) {
-                debounced_pressed[i] = is_pressed_now ? 1 : 0;
-            }
+            s_button_last_state = s_button_state;
         }
-
-        s_button_last_state = s_button_state;
 
         touch_read_all(touch_values);
         for (int i = 0; i < BUTTON_COUNT; ++i) {
-            touch_active[i] = touch_is_active((size_t)i, touch_values[i]);
+            bool is_touched = touch_is_active(i, touch_values[i]);
+            if (is_touched != last_touch_state[i]) {
+                input_event_t evt = {
+                    .type = is_touched ? EVT_TOUCH_START : EVT_TOUCH_END,
+                    .btn_idx = i
+                };
+                xQueueSend(s_btn_event_queue, &evt, 0);
+                last_touch_state[i] = is_touched;
+            }
         }
-
-        update_led_status(debounced_pressed, touch_active);
-        update_lcd_status(debounced_pressed, touch_active);
-
-        ESP_LOGI(TAG,
-                 "BTN raw=0x%02X deb=%d%d%d%d%d%d  TOUCH=%u,%u,%u,%u,%u,%u",
-                 raw,
-                 debounced_pressed[0], debounced_pressed[1], debounced_pressed[2],
-                 debounced_pressed[3], debounced_pressed[4], debounced_pressed[5],
-                 (unsigned)touch_values[0], (unsigned)touch_values[1], (unsigned)touch_values[2],
-                 (unsigned)touch_values[3], (unsigned)touch_values[4], (unsigned)touch_values[5]);
-
-        vTaskDelay(pdMS_TO_TICKS(20));
+        vTaskDelay(pdMS_TO_TICKS(20)); 
     }
 }
 
+/* --- Web Server Implementation --- */
+
+// The HTML Template
+static const char* html_template = 
+    "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width, initial-scale=1'>"
+    "<style>body{font-family:Arial;max-width:400px;margin:20px auto;padding:20px;background:#f4f4f4;}"
+    "input{width:100%%;padding:10px;margin:10px 0;box-sizing:border-box;border:1px solid #ccc;border-radius:4px;}"
+    "button{width:100%%;background:#007BFF;color:white;padding:14px;border:none;border-radius:4px;font-size:16px;}</style></head>"
+    "<body><h2>Panel Configuration</h2><form action='/save' method='POST'>"
+    "<label>MQTT Broker IP:</label><input type='text' name='mqtt_ip' value='%s'>"
+    "<label>MQTT Port:</label><input type='text' name='mqtt_port' value='%s'>"
+    "<label>MQTT Username:</label><input type='text' name='mqtt_user' value='%s'>"
+    "<label>MQTT Password:</label><input type='password' name='mqtt_pass' value='%s'>"
+    "<button type='submit'>Save & Reboot</button></form></body></html>";
+
+// GET Handler - Serves the HTML page
+static esp_err_t config_get_handler(httpd_req_t *req)
+{
+    char response_html[1024];
+    snprintf(response_html, sizeof(response_html), html_template, 
+             s_mqtt_config.broker_ip, s_mqtt_config.port, 
+             s_mqtt_config.username, s_mqtt_config.password);
+    
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, response_html, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+// POST Handler - Parses the form submission
+static esp_err_t config_post_handler(httpd_req_t *req)
+{
+    char buf[256];
+    int ret, remaining = req->content_len;
+
+    if (remaining >= sizeof(buf)) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    // Read the POST body
+    ret = httpd_req_recv(req, buf, remaining);
+    if (ret <= 0) {
+        if (ret == HTTPD_SOCK_ERR_TIMEOUT) {
+            httpd_resp_send_408(req);
+        }
+        return ESP_FAIL;
+    }
+    buf[ret] = '\0';
+
+    // Parse the application/x-www-form-urlencoded data
+    httpd_query_key_value(buf, "mqtt_ip", s_mqtt_config.broker_ip, sizeof(s_mqtt_config.broker_ip));
+    httpd_query_key_value(buf, "mqtt_port", s_mqtt_config.port, sizeof(s_mqtt_config.port));
+    httpd_query_key_value(buf, "mqtt_user", s_mqtt_config.username, sizeof(s_mqtt_config.username));
+    httpd_query_key_value(buf, "mqtt_pass", s_mqtt_config.password, sizeof(s_mqtt_config.password));
+
+    // Save to memory and respond
+    save_settings_nvs();
+    
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, "<h2>Settings Saved! Rebooting...</h2>", HTTPD_RESP_USE_STRLEN);
+    
+    // Reboot the ESP32 after 1 second to apply new networking changes
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    esp_restart();
+    
+    return ESP_OK;
+}
+
+// Start the HTTP server
+static httpd_handle_t start_webserver(void)
+{
+    httpd_handle_t server = NULL;
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.max_uri_handlers = 8; 
+
+    if (httpd_start(&server, &config) == ESP_OK) {
+        httpd_uri_t uri_get = { .uri = "/", .method = HTTP_GET, .handler = config_get_handler, .user_ctx = NULL };
+        httpd_register_uri_handler(server, &uri_get);
+
+        httpd_uri_t uri_post = { .uri = "/save", .method = HTTP_POST, .handler = config_post_handler, .user_ctx = NULL };
+        httpd_register_uri_handler(server, &uri_post);
+        
+        ESP_LOGI(TAG, "Web server started on port %d", config.server_port);
+        return server;
+    }
+    return NULL;
+}
+
+
+/* --- Main Entry Point --- */
 void app_main(void)
 {
-    ESP_ERROR_CHECK(nvs_flash_init());
+    // 1. Initialize NVS (Required for Wi-Fi and later web settings)
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+      ESP_ERROR_CHECK(nvs_flash_erase());
+      ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
-    ESP_ERROR_CHECK(esp_event_handler_register(ETH_EVENT, ESP_EVENT_ANY_ID, &eth_event_handler, NULL));
-    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_GOT_IP, &eth_event_handler, NULL));
+    // 2. Initialize Hardware
+    // (Ensure the names match the functions you pasted in Step 1)
+    i2c_init();       
+    lcd_init();
+    buttons_init();
+    touch_init_all();
+    ws2812_init();
+    
+    // 3. Initialize Network Failover
+    init_network_failover();
 
-    i2c_config_t i2c_cfg = {
-        .mode = I2C_MODE_MASTER,
-        .sda_io_num = I2C_SDA,
-        .scl_io_num = I2C_SCL,
-        .sda_pullup_en = GPIO_PULLUP_ENABLE,
-        .scl_pullup_en = GPIO_PULLUP_ENABLE,
-        .master.clk_speed = I2C_FREQ_HZ,
-        .clk_flags = 0,
-    };
+    // 4. Load Configuration
+    load_default_config();
+    load_settings_nvs(); // Overwrite defaults with saved NVS values
 
-    ESP_ERROR_CHECK(i2c_param_config(I2C_PORT, &i2c_cfg));
-    ESP_ERROR_CHECK(i2c_driver_install(I2C_PORT, i2c_cfg.mode, 0, 0, 0));
-
-    i2c_scan_log();
-
-    if (lcd_init() != ESP_OK) {
-        ESP_LOGW(TAG, "LCD init failed at 0x%02X", PCF_LCD_ADDR);
-    } else {
-        lcd_set_lines("WT32 HW TEST", "Init OK");
-    }
-
-    if (buttons_init() != ESP_OK) {
-        ESP_LOGE(TAG, "Button PCF8574 init failed at 0x%02X", PCF_BUTTON_ADDR);
-    }
-
-    if (touch_init_all() != ESP_OK) {
-        ESP_LOGW(TAG, "Touch init failed (rings disabled)");
-    } else {
-        ESP_LOGI(TAG, "Touch baseline: %u,%u,%u,%u,%u,%u",
-                 (unsigned)s_touch_baseline[0], (unsigned)s_touch_baseline[1], (unsigned)s_touch_baseline[2],
-                 (unsigned)s_touch_baseline[3], (unsigned)s_touch_baseline[4], (unsigned)s_touch_baseline[5]);
-    }
-
-    if (ws2812_init() != ESP_OK) {
-        ESP_LOGW(TAG, "WS2812 init failed on GPIO %d", (int)LED_PIN);
-    }
-
-    if (ethernet_init() != ESP_OK) {
-        ESP_LOGW(TAG, "Ethernet init failed");
-    }
-
-    xTaskCreate(hardware_test_task, "hardware_test_task", 4096, NULL, 5, NULL);
+    // 5. Create Queues and Tasks
+    s_btn_event_queue = xQueueCreate(20, sizeof(input_event_t));
+    xTaskCreate(hardware_task, "hw_poll", 4096, NULL, 5, NULL);
+    xTaskCreate(logic_task, "app_logic", 4096, NULL, 4, NULL);
+    
+    // 6. Start Web Server
+    start_webserver();
+    
+    ESP_LOGI(TAG, "System Boot Complete. Tasks running.");
 }
