@@ -112,6 +112,8 @@ static system_config_t s_config;
 static uint8_t s_current_bank = 0;
 static bool s_btn_states[MAX_BANKS][MAIN_BTN_COUNT] = {false}; // Logical states (ON/OFF)
 static bool s_in_menu = false;
+static bool s_mqtt_connected = false;
+static bool s_startup_complete = false;
 
 // Network status
 static bool s_eth_connected = false;
@@ -120,7 +122,7 @@ static bool s_wifi_connected = false;
 // Queues for inter-task communication
 static QueueHandle_t s_btn_event_queue;
 
-typedef enum { EVT_BTN_PRESSED, EVT_BTN_RELEASED, EVT_TOUCH_START, EVT_TOUCH_END } event_type_t;
+typedef enum { EVT_BTN_PRESSED, EVT_BTN_RELEASED, EVT_TOUCH_START, EVT_TOUCH_END, EVT_MQTT_SYNC } event_type_t;
 typedef struct {
     event_type_t type;
     uint8_t btn_idx;
@@ -140,6 +142,17 @@ static int64_t s_button_last_change_ms[BUTTON_COUNT] = {0};
 
 static char s_lcd_last_line1[17] = {0};
 static char s_lcd_last_line2[17] = {0};
+
+static void request_ui_refresh(void)
+{
+    if (s_btn_event_queue != NULL) {
+        input_event_t sync_evt = {
+            .type = EVT_MQTT_SYNC,
+            .btn_idx = 0xFF,
+        };
+        xQueueSend(s_btn_event_queue, &sync_evt, 0);
+    }
+}
 
 
 static int64_t now_ms(void)
@@ -480,9 +493,59 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     
     if (event->event_id == MQTT_EVENT_CONNECTED) {
         ESP_LOGI(TAG, "MQTT Connected to Broker!");
+        s_mqtt_connected = true;
+
+        // Subscribe to all button state topics
+        for (int b = 0; b < s_config.num_banks; b++) {
+            for (int i = 0; i < MAIN_BTN_COUNT; i++) {
+                char sub_topic[80];
+                snprintf(sub_topic, sizeof(sub_topic), "%s/state", s_config.banks[b].buttons[i].mqtt_topic);
+                esp_mqtt_client_subscribe(s_mqtt_client, sub_topic, 1);
+                ESP_LOGI(TAG, "Subscribed to: %s", sub_topic);
+            }
+        }
         // We will add subscription logic here later for 2-way sync
+        request_ui_refresh();
     } else if (event->event_id == MQTT_EVENT_DISCONNECTED) {
         ESP_LOGW(TAG, "MQTT Disconnected from Broker");
+        s_mqtt_connected = false;
+        request_ui_refresh();
+    } else if (event->event_id == MQTT_EVENT_DATA) {
+        // Note: MQTT payloads are NOT null-terminated in the event struct!
+        char topic[80];
+        int topic_len = event->topic_len < sizeof(topic) - 1 ? event->topic_len : sizeof(topic) - 1;
+        memcpy(topic, event->topic, topic_len);
+        topic[topic_len] = '\0';
+        
+        char payload[16];
+        int payload_len = event->data_len < sizeof(payload) - 1 ? event->data_len : sizeof(payload) - 1;
+        memcpy(payload, event->data, payload_len);
+        payload[payload_len] = '\0';
+        
+        ESP_LOGI(TAG, "MQTT RECV: %s -> %s", topic, payload);
+        
+        bool new_state = (strncmp(payload, "ON", 2) == 0);
+        
+        // Find the matching button and update its state
+        for (int b = 0; b < s_config.num_banks; b++) {
+            for (int i = 0; i < MAIN_BTN_COUNT; i++) {
+                char expected_topic[80];
+                snprintf(expected_topic, sizeof(expected_topic), "%s/state", s_config.banks[b].buttons[i].mqtt_topic);
+                
+                if (strcmp(topic, expected_topic) == 0) {
+                    s_btn_states[b][i] = new_state;
+                    
+                    // Only force a UI update if the changed button is on the currently visible bank
+                    if (b == s_current_bank) {
+                        input_event_t sync_evt = { 
+                            .type = EVT_MQTT_SYNC, 
+                            .btn_idx = 0xFF // Dummy index to prevent triggering physical button logic
+                        };
+                        xQueueSend(s_btn_event_queue, &sync_evt, 0);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -492,6 +555,8 @@ static void start_mqtt(void) {
         esp_mqtt_client_destroy(s_mqtt_client);
         s_mqtt_client = NULL;
     }
+
+    s_mqtt_connected = false;
 
     // Don't try to connect if the web UI hasn't been configured yet
     if (strlen(s_mqtt_config.broker_ip) == 0) {
@@ -515,7 +580,7 @@ static void start_mqtt(void) {
 }
 
 static void publish_mqtt_state(uint8_t bank, uint8_t btn, bool state) {
-    if (!s_mqtt_client) return; // Fail gracefully if not connected
+    if (!s_mqtt_client || !s_mqtt_connected) return; // Fail gracefully if not connected
     
     char pub_topic[80];
     snprintf(pub_topic, sizeof(pub_topic), "%s/set", s_config.banks[bank].buttons[btn].mqtt_topic);
@@ -700,6 +765,40 @@ static void load_default_config(void)
     }
 }
 
+static void render_startup_frame(uint8_t phase)
+{
+    uint8_t rgb[LED_COUNT][3] = {0};
+    const uint8_t orange[3] = {255, 96, 0};
+
+    uint8_t brightness = (uint8_t)((phase < 20 ? phase : 39 - phase) * 13);
+    rgb[BTN_BANK_DOWN][0] = (uint8_t)((orange[0] * brightness) / 255U);
+    rgb[BTN_BANK_DOWN][1] = (uint8_t)((orange[1] * brightness) / 255U);
+    rgb[BTN_BANK_DOWN][2] = (uint8_t)((orange[2] * brightness) / 255U);
+    rgb[BTN_BANK_UP][0] = rgb[BTN_BANK_DOWN][0];
+    rgb[BTN_BANK_UP][1] = rgb[BTN_BANK_DOWN][1];
+    rgb[BTN_BANK_UP][2] = rgb[BTN_BANK_DOWN][2];
+
+    ws2812_show(rgb);
+}
+
+static void startup_task(void *arg)
+{
+    uint8_t phase = 0;
+
+    lcd_set_lines(s_config.panel_name, "Starting...");
+
+    while (!s_startup_complete) {
+        render_startup_frame(phase);
+        phase = (uint8_t)((phase + 1) % 40);
+        vTaskDelay(pdMS_TO_TICKS(30));
+    }
+
+    uint8_t rgb[LED_COUNT][3] = {0};
+    ws2812_show(rgb);
+
+    vTaskDelete(NULL);
+}
+
 static void update_system_ui(int touch_preview_idx)
 {
     char line1[32];
@@ -710,42 +809,71 @@ static void update_system_ui(int touch_preview_idx)
         snprintf(line1, sizeof(line1), "--- MENU ---");
         snprintf(line2, sizeof(line2), "Settings..."); 
     } else if (touch_preview_idx >= 0 && touch_preview_idx < MAIN_BTN_COUNT) {
+        snprintf(line1, sizeof(line1), "%s", s_config.banks[s_current_bank].bank_name);
         button_config_t *btn = &s_config.banks[s_current_bank].buttons[touch_preview_idx];
-        snprintf(line1, sizeof(line1), "Btn: %s", btn->display_name);
-        snprintf(line2, sizeof(line2), "Act: %s", s_btn_states[s_current_bank][touch_preview_idx] ? "ON" : "OFF");
+        snprintf(line2, sizeof(line2), "%s", btn->display_name);
     } else {
         snprintf(line1, sizeof(line1), "%s", s_config.banks[s_current_bank].bank_name);
-        snprintf(line2, sizeof(line2), "Net: %s", s_eth_has_ip ? "ONLINE" : "OFFLINE");
+        if (s_mqtt_connected) {
+            line2[0] = '\0';
+        } else {
+            snprintf(line2, sizeof(line2), "MQTT OFFLINE");
+        }
     }
     lcd_set_lines(line1, line2);
 
     // --- LED Updates ---
     uint8_t rgb[LED_COUNT][3] = {0};
-    
-    for (int i = 0; i < MAIN_BTN_COUNT; i++) {
-        button_config_t *btn_cfg = &s_config.banks[s_current_bank].buttons[i];
-        bool is_on = s_btn_states[s_current_bank][i];
-        
-        if (is_on) {
-            memcpy(rgb[i], btn_cfg->color_on, 3);
-        } else {
-            memcpy(rgb[i], btn_cfg->color_off, 3);
+
+    if (s_mqtt_connected) {
+        for (int i = 0; i < MAIN_BTN_COUNT; i++) {
+            button_config_t *btn_cfg = &s_config.banks[s_current_bank].buttons[i];
+            bool is_on = s_btn_states[s_current_bank][i];
+
+            if (is_on) {
+                memcpy(rgb[i], btn_cfg->color_on, 3);
+            } else {
+                memcpy(rgb[i], btn_cfg->color_off, 3);
+            }
         }
-        
-        // Removed the touch_preview_idx override block here
+
+        // Keep the bank buttons visible during normal operation.
+        rgb[BTN_BANK_DOWN][0] = 48; rgb[BTN_BANK_DOWN][1] = 48; rgb[BTN_BANK_DOWN][2] = 48;
+        rgb[BTN_BANK_UP][0] = 48; rgb[BTN_BANK_UP][1] = 48; rgb[BTN_BANK_UP][2] = 48;
     }
 
-    // Increased Bank Up/Down static brightness to balance with max RGB
-    rgb[BTN_BANK_DOWN][0] = 64; rgb[BTN_BANK_DOWN][1] = 64; rgb[BTN_BANK_DOWN][2] = 64;
-    rgb[BTN_BANK_UP][0] = 64; rgb[BTN_BANK_UP][1] = 64; rgb[BTN_BANK_UP][2] = 64;
-
     ws2812_show(rgb);
+}
+
+static void refresh_touch_preview(int *current_touch_preview, bool touch_active[MAIN_BTN_COUNT], uint32_t touch_order[MAIN_BTN_COUNT])
+{
+    int next_preview = -1;
+    uint32_t best_order = 0;
+
+    for (int i = 0; i < MAIN_BTN_COUNT; ++i) {
+        if (!touch_active[i]) {
+            continue;
+        }
+
+        if (next_preview < 0 || touch_order[i] >= best_order) {
+            next_preview = i;
+            best_order = touch_order[i];
+        }
+    }
+
+    if (next_preview != *current_touch_preview) {
+        *current_touch_preview = next_preview;
+        update_system_ui(*current_touch_preview);
+    }
 }
 
 static void logic_task(void *arg)
 {
     input_event_t evt;
     int current_touch_preview = -1;
+    bool touch_active[MAIN_BTN_COUNT] = {false};
+    uint32_t touch_order[MAIN_BTN_COUNT] = {0};
+    uint32_t touch_seq = 0;
     int64_t menu_timer_start = 0;
     bool bank_btns_held[2] = {false, false};
 
@@ -753,6 +881,11 @@ static void logic_task(void *arg)
 
     while (1) {
         if (xQueueReceive(s_btn_event_queue, &evt, pdMS_TO_TICKS(50))) {
+
+            if (evt.type == EVT_MQTT_SYNC) {
+                update_system_ui(current_touch_preview);
+            }
+
             if (evt.btn_idx == BTN_BANK_DOWN || evt.btn_idx == BTN_BANK_UP) {
                 if (evt.type == EVT_BTN_PRESSED) {
                     bank_btns_held[evt.btn_idx - BTN_BANK_DOWN] = true;
@@ -772,11 +905,14 @@ static void logic_task(void *arg)
             }
 
             if (evt.type == EVT_TOUCH_START && evt.btn_idx < MAIN_BTN_COUNT) {
-                current_touch_preview = evt.btn_idx;
-                update_system_ui(current_touch_preview);
-            } else if (evt.type == EVT_TOUCH_END && evt.btn_idx == current_touch_preview) {
-                current_touch_preview = -1;
-                update_system_ui(current_touch_preview);
+                touch_active[evt.btn_idx] = true;
+                touch_order[evt.btn_idx] = ++touch_seq;
+            } else if (evt.type == EVT_TOUCH_END && evt.btn_idx < MAIN_BTN_COUNT) {
+                touch_active[evt.btn_idx] = false;
+            }
+
+            if (evt.type == EVT_TOUCH_START || evt.type == EVT_TOUCH_END) {
+                refresh_touch_preview(&current_touch_preview, touch_active, touch_order);
             }
 
             if (evt.btn_idx < MAIN_BTN_COUNT) {
@@ -970,6 +1106,11 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
+    load_default_config();
+    load_settings_nvs(); // Overwrite defaults with saved NVS values
+
+    s_btn_event_queue = xQueueCreate(20, sizeof(input_event_t));
+
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
@@ -980,21 +1121,24 @@ void app_main(void)
     buttons_init();
     touch_init_all();
     ws2812_init();
+
+    s_startup_complete = false;
+    xTaskCreate(startup_task, "startup_ui", 3072, NULL, 6, NULL);
     
     // 3. Initialize Network Failover
     init_network_failover();
 
-    // 4. Load Configuration
-    load_default_config();
-    load_settings_nvs(); // Overwrite defaults with saved NVS values
-
-    // 5. Create Queues and Tasks
-    s_btn_event_queue = xQueueCreate(20, sizeof(input_event_t));
+    // 4. Create Tasks
     xTaskCreate(hardware_task, "hw_poll", 4096, NULL, 5, NULL);
+    
+    // 5. Start Web Server
+    start_webserver();
+
+    s_startup_complete = true;
+
     xTaskCreate(logic_task, "app_logic", 4096, NULL, 4, NULL);
     
-    // 6. Start Web Server
-    start_webserver();
-    
+    update_system_ui(-1);
+
     ESP_LOGI(TAG, "System Boot Complete. Tasks running.");
 }
