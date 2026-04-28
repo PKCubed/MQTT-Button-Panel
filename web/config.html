@@ -37,8 +37,39 @@
         <label>Password (optional)</label>
         <input name="mqtt.password" type="password" placeholder="password">
       </div>
+      <h3>WiFi Settings</h3>
+      <div class="form-group">
+        <label>WiFi SSID</label>
+        <input name="wifi.ssid" placeholder="Network Name">
+      </div>
+      <div class="form-group">
+        <label>WiFi Password</label>
+        <input name="wifi.password" type="password" placeholder="Password">
+      </div>
+      <div class="form-group">
+        <label><input type="checkbox" name="wifi.use_dhcp" id="use_dhcp"> Use DHCP (Automatic IP)</label>
+      </div>
+      <fieldset id="static-ip-fields" style="display:none">
+        <legend>Static IP Configuration</legend>
+        <div class="form-group">
+          <label>IP Address</label>
+          <input name="wifi.static_ip" placeholder="192.168.1.50">
+        </div>
+        <div class="form-group">
+          <label>Netmask</label>
+          <input name="wifi.static_netmask" placeholder="255.255.255.0">
+        </div>
+        <div class="form-group">
+          <label>Gateway</label>
+          <input name="wifi.static_gateway" placeholder="192.168.1.1">
+        </div>
+      </fieldset>
       <button type="submit">Save Configuration</button>
     </form>
+    <div style="margin-top:24px;padding-top:24px;border-top:1px solid #ddd;">
+      <h3>Device Management</h3>
+      <button id="restart-btn" type="button" style="background:#e74c3c;">Restart Device</button>
+    </div>
   </main>
   <script src="/static/app.js"></script>
 </body>

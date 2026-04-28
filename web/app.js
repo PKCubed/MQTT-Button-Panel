@@ -44,6 +44,22 @@ async function initConfig(){
     form.elements['mqtt.port'].value = cfg.mqtt.port || '';
     form.elements['mqtt.username'].value = cfg.mqtt.username || '';
     form.elements['mqtt.password'].value = cfg.mqtt.password || '';
+    
+    form.elements['wifi.ssid'].value = cfg.wifi.ssid || '';
+    form.elements['wifi.password'].value = cfg.wifi.password || '';
+    form.elements['wifi.use_dhcp'].checked = cfg.wifi.use_dhcp;
+    form.elements['wifi.static_ip'].value = cfg.wifi.static_ip || '';
+    form.elements['wifi.static_netmask'].value = cfg.wifi.static_netmask || '';
+    form.elements['wifi.static_gateway'].value = cfg.wifi.static_gateway || '';
+    
+    // Toggle static IP fields visibility
+    const staticFields = document.getElementById('static-ip-fields');
+    const dhcpCheckbox = document.getElementById('use_dhcp');
+    const updateStaticFieldsVisibility = () => {
+      staticFields.style.display = dhcpCheckbox.checked ? 'none' : 'block';
+    };
+    dhcpCheckbox.addEventListener('change', updateStaticFieldsVisibility);
+    updateStaticFieldsVisibility(); // Set initial state
 
     form.addEventListener('submit', async (ev)=>{
       ev.preventDefault();
@@ -56,6 +72,14 @@ async function initConfig(){
             port: form.elements['mqtt.port'].value,
             username: form.elements['mqtt.username'].value,
             password: form.elements['mqtt.password'].value
+          },
+          wifi: {
+            ssid: form.elements['wifi.ssid'].value,
+            password: form.elements['wifi.password'].value,
+            use_dhcp: form.elements['wifi.use_dhcp'].checked,
+            static_ip: form.elements['wifi.static_ip'].value,
+            static_netmask: form.elements['wifi.static_netmask'].value,
+            static_gateway: form.elements['wifi.static_gateway'].value
           }
         };
         const res = await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
@@ -69,6 +93,27 @@ async function initConfig(){
         alertDiv.innerHTML = '<div class="alert error">✗ Error: '+e.message+'</div>';
       }
     });
+    
+    const restartBtn = document.getElementById('restart-btn');
+    if(restartBtn){
+      restartBtn.addEventListener('click', async ()=>{
+        const alertDiv = document.getElementById('alert');
+        if(!confirm('Are you sure you want to restart the device?')) return;
+        try {
+          const res = await fetch('/api/reboot', {method: 'POST', headers: {'Content-Type': 'application/json'}});
+          if(res.ok){
+            alertDiv.innerHTML = '<div class="alert success">✓ Device rebooting...</div>';
+            setTimeout(() => {
+              alertDiv.innerHTML = '<div class="alert error">Connection lost (device is restarting)</div>';
+            }, 1000);
+          }else{
+            alertDiv.innerHTML = '<div class="alert error">✗ Failed to reboot device</div>';
+          }
+        }catch(e){
+          alertDiv.innerHTML = '<div class="alert error">✗ Error: '+e.message+'</div>';
+        }
+      });
+    }
   }catch(e){console.error(e)}
 }
 

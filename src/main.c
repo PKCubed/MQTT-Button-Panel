@@ -23,6 +23,7 @@
 #include "web_assets.h"
 
 #include "mqtt_client.h"
+#include "esp_system.h"
 static esp_mqtt_client_handle_t s_mqtt_client = NULL;
 
 #define ARRAY_LEN(x) (sizeof(x) / sizeof((x)[0]))
@@ -112,6 +113,15 @@ typedef struct {
     char password[64];
 } mqtt_config_t;
 
+typedef struct {
+    char ssid[33];           // WiFi SSID (max 32 chars)
+    char password[64];       // WiFi password
+    bool use_dhcp;           // true = DHCP, false = static IP
+    char static_ip[16];      // Static IP address (e.g., "192.168.1.50")
+    char static_netmask[16]; // Netmask (e.g., "255.255.255.0")
+    char static_gateway[16]; // Gateway (e.g., "192.168.1.1")
+} app_wifi_config_t;
+
 /* Default MQTT settings are loaded into RAM first, then overwritten from     */
 /* NVS if the user has already saved values from the web UI.                  */
 static mqtt_config_t s_mqtt_config = {
@@ -119,6 +129,16 @@ static mqtt_config_t s_mqtt_config = {
     .port = "1883",
     .username = "",
     .password = ""
+};
+
+/* Default WiFi settings */
+static app_wifi_config_t s_wifi_config = {
+    .ssid = "YOUR_SSID",
+    .password = "YOUR_PASS",
+    .use_dhcp = true,
+    .static_ip = "192.168.1.100",
+    .static_netmask = "255.255.255.0",
+    .static_gateway = "192.168.1.1"
 };
 
 /* -------------------------------------------------------------------------- */
@@ -654,13 +674,17 @@ static void net_event_handler(void *arg, esp_event_base_t event_base, int32_t ev
             case ETHERNET_EVENT_CONNECTED:
                 ESP_LOGI(TAG, "Ethernet Link Up");
                 s_eth_connected = true;
-                // Optional: Stop Wi-Fi to save power if ETH connects
-                esp_wifi_stop(); 
+                s_wifi_connected = false;
+                // Stop Wi-Fi to save power when ETH is available
+                esp_wifi_stop();
                 break;
             case ETHERNET_EVENT_DISCONNECTED:
                 ESP_LOGI(TAG, "Ethernet Link Down - Starting Wi-Fi Fallback");
                 s_eth_connected = false;
+                s_eth_has_ip = false;
+                // Start WiFi as fallback
                 esp_wifi_start();
+                vTaskDelay(pdMS_TO_TICKS(100)); // Brief delay for WiFi to stabilize
                 esp_wifi_connect();
                 break;
         }
@@ -669,17 +693,32 @@ static void net_event_handler(void *arg, esp_event_base_t event_base, int32_t ev
         ESP_LOGI(TAG, "ETH Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
         s_eth_has_ip = true;
         start_mqtt();
-    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        if (!s_eth_connected) {
-            ESP_LOGI(TAG, "Wi-Fi Disconnected, retrying...");
-            esp_wifi_connect();
+    } else if (event_base == WIFI_EVENT) {
+        switch (event_id) {
+            case WIFI_EVENT_STA_START:
+                ESP_LOGI(TAG, "Wi-Fi started, attempting connection...");
+                break;
+            case WIFI_EVENT_STA_CONNECTED:
+                ESP_LOGI(TAG, "Wi-Fi connected to AP");
+                break;
+            case WIFI_EVENT_STA_DISCONNECTED:
+                // Only auto-retry if Ethernet is not connected
+                if (!s_eth_connected) {
+                    ESP_LOGI(TAG, "Wi-Fi Disconnected, retrying...");
+                    vTaskDelay(pdMS_TO_TICKS(500));
+                    esp_wifi_connect();
+                }
+                s_wifi_connected = false;
+                break;
         }
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *) event_data;
-        s_eth_has_ip = true;
-        ESP_LOGI(TAG, "WIFI Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
+        ESP_LOGI(TAG, "WiFi Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
         s_wifi_connected = true;
-        start_mqtt();
+        if (!s_eth_has_ip) {
+            // Only start MQTT if Ethernet hasn't already
+            start_mqtt();
+        }
     }
 }
 
@@ -721,14 +760,38 @@ static void init_network_failover(void) {
     wifi_init_config_t wifi_cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&wifi_cfg));
     
+    // Use loaded WiFi config from NVS
     wifi_config_t sta_config = {
         .sta = {
-            .ssid = "YOUR_SSID",     
-            .password = "YOUR_PASS", 
+            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
         },
     };
+    strncpy((char*)sta_config.sta.ssid, s_wifi_config.ssid, sizeof(sta_config.sta.ssid) - 1);
+    strncpy((char*)sta_config.sta.password, s_wifi_config.password, sizeof(sta_config.sta.password) - 1);
+    
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_config));
+    
+    // Apply static IP settings if not using DHCP
+    esp_netif_t *wifi_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (wifi_netif && !s_wifi_config.use_dhcp) {
+        esp_netif_dhcpc_stop(wifi_netif);
+        esp_netif_ip_info_t ip_info;
+        esp_netif_str_to_ip4(s_wifi_config.static_ip, &ip_info.ip);
+        esp_netif_str_to_ip4(s_wifi_config.static_netmask, &ip_info.netmask);
+        esp_netif_str_to_ip4(s_wifi_config.static_gateway, &ip_info.gw);
+        esp_netif_set_ip_info(wifi_netif, &ip_info);
+    }
+    
+    // Start WiFi so it's ready
+    ESP_ERROR_CHECK(esp_wifi_start());
+    
+    // Try WiFi connection immediately if SSID is configured (non-empty)
+    if (s_wifi_config.ssid[0] != '\0') {
+        vTaskDelay(pdMS_TO_TICKS(500)); // Give WiFi stack time to settle
+        ESP_LOGI(TAG, "Attempting WiFi connection on boot: %s", s_wifi_config.ssid);
+        esp_wifi_connect();
+    }
 
     // Register Handlers
     esp_event_handler_register(ETH_EVENT, ESP_EVENT_ANY_ID, &net_event_handler, NULL);
@@ -1180,6 +1243,8 @@ static esp_err_t config_post_handler(httpd_req_t *req)
 /* Forward declarations for functions defined later in this file. */
 static void save_full_config_nvs(void);
 static void load_full_config_nvs(void);
+static void apply_wifi_config(void);
+static esp_err_t api_reboot_handler(httpd_req_t *req);
 
 
 /* JSON API: GET /api/config - returns the current system and mqtt config */
@@ -1197,6 +1262,15 @@ static esp_err_t api_get_config_handler(httpd_req_t *req)
     cJSON_AddStringToObject(mqtt, "username", s_mqtt_config.username);
     cJSON_AddStringToObject(mqtt, "password", s_mqtt_config.password);
     cJSON_AddItemToObject(root, "mqtt", mqtt);
+
+    cJSON *wifi = cJSON_CreateObject();
+    cJSON_AddStringToObject(wifi, "ssid", s_wifi_config.ssid);
+    cJSON_AddStringToObject(wifi, "password", s_wifi_config.password);
+    cJSON_AddBoolToObject(wifi, "use_dhcp", s_wifi_config.use_dhcp);
+    cJSON_AddStringToObject(wifi, "static_ip", s_wifi_config.static_ip);
+    cJSON_AddStringToObject(wifi, "static_netmask", s_wifi_config.static_netmask);
+    cJSON_AddStringToObject(wifi, "static_gateway", s_wifi_config.static_gateway);
+    cJSON_AddItemToObject(root, "wifi", wifi);
 
     cJSON *banks = cJSON_CreateArray();
     for (int b = 0; b < s_config.num_banks && b < MAX_BANKS; ++b) {
@@ -1279,6 +1353,22 @@ static esp_err_t api_post_config_handler(httpd_req_t *req)
         if (cJSON_IsString(pass) && pass->valuestring) snprintf(s_mqtt_config.password, sizeof(s_mqtt_config.password), "%s", pass->valuestring);
     }
 
+    cJSON *wifi = cJSON_GetObjectItemCaseSensitive(root, "wifi");
+    if (cJSON_IsObject(wifi)) {
+        cJSON *ssid = cJSON_GetObjectItemCaseSensitive(wifi, "ssid");
+        cJSON *wpass = cJSON_GetObjectItemCaseSensitive(wifi, "password");
+        cJSON *dhcp = cJSON_GetObjectItemCaseSensitive(wifi, "use_dhcp");
+        cJSON *sip = cJSON_GetObjectItemCaseSensitive(wifi, "static_ip");
+        cJSON *smask = cJSON_GetObjectItemCaseSensitive(wifi, "static_netmask");
+        cJSON *sgw = cJSON_GetObjectItemCaseSensitive(wifi, "static_gateway");
+        if (cJSON_IsString(ssid) && ssid->valuestring) snprintf(s_wifi_config.ssid, sizeof(s_wifi_config.ssid), "%s", ssid->valuestring);
+        if (cJSON_IsString(wpass) && wpass->valuestring) snprintf(s_wifi_config.password, sizeof(s_wifi_config.password), "%s", wpass->valuestring);
+        if (cJSON_IsBool(dhcp)) s_wifi_config.use_dhcp = dhcp->type == cJSON_True;
+        if (cJSON_IsString(sip) && sip->valuestring) snprintf(s_wifi_config.static_ip, sizeof(s_wifi_config.static_ip), "%s", sip->valuestring);
+        if (cJSON_IsString(smask) && smask->valuestring) snprintf(s_wifi_config.static_netmask, sizeof(s_wifi_config.static_netmask), "%s", smask->valuestring);
+        if (cJSON_IsString(sgw) && sgw->valuestring) snprintf(s_wifi_config.static_gateway, sizeof(s_wifi_config.static_gateway), "%s", sgw->valuestring);
+    }
+
     /* Optional: parse banks/buttons if provided */
     cJSON *banks = cJSON_GetObjectItemCaseSensitive(root, "banks");
     if (cJSON_IsArray(banks)) {
@@ -1329,6 +1419,7 @@ static esp_err_t api_post_config_handler(httpd_req_t *req)
 
     /* Persist and apply */
     save_full_config_nvs();
+    apply_wifi_config();
     start_mqtt();
 
     httpd_resp_set_type(req, "application/json");
@@ -1384,7 +1475,7 @@ static httpd_handle_t start_webserver(void)
 {
     httpd_handle_t server = NULL;
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 16;  /* Accommodate all endpoints: save, api config/diag, pages, static assets */ 
+    config.max_uri_handlers = 17;  /* Accommodate all endpoints: save, api config/diag/reboot, pages, static assets */ 
 
     if (httpd_start(&server, &config) == ESP_OK) {
         /* Serve root and pages */
@@ -1414,6 +1505,7 @@ static httpd_handle_t start_webserver(void)
         httpd_register_uri_handler(server, &(httpd_uri_t){ .uri = "/api/config", .method = HTTP_GET, .handler = api_get_config_handler, .user_ctx = NULL });
         httpd_register_uri_handler(server, &(httpd_uri_t){ .uri = "/api/config", .method = HTTP_POST, .handler = api_post_config_handler, .user_ctx = NULL });
         httpd_register_uri_handler(server, &(httpd_uri_t){ .uri = "/api/diag", .method = HTTP_GET, .handler = api_diag_handler, .user_ctx = NULL });
+        httpd_register_uri_handler(server, &(httpd_uri_t){ .uri = "/api/reboot", .method = HTTP_POST, .handler = api_reboot_handler, .user_ctx = NULL });
 
         /* Serve UI pages and static assets using small inline handlers that use embedded strings */
         extern esp_err_t serve_dashboard_handler(httpd_req_t *req);
@@ -1493,13 +1585,14 @@ void app_main(void)
     ESP_LOGI(TAG, "System Boot Complete. Tasks running.");
 }
 
-/* Persist the entire system configuration (system + mqtt) as blobs in NVS. */
+/* Persist the entire system configuration (system + mqtt + wifi) as blobs in NVS. */
 static void save_full_config_nvs(void)
 {
     nvs_handle_t my_handle;
     if (nvs_open("storage", NVS_READWRITE, &my_handle) == ESP_OK) {
         nvs_set_blob(my_handle, "sys_cfg", &s_config, sizeof(s_config));
         nvs_set_blob(my_handle, "mqtt_cfg", &s_mqtt_config, sizeof(s_mqtt_config));
+        nvs_set_blob(my_handle, "wifi_cfg", &s_wifi_config, sizeof(s_wifi_config));
         nvs_commit(my_handle);
         nvs_close(my_handle);
         ESP_LOGI(TAG, "Full config saved to NVS");
@@ -1521,6 +1614,66 @@ static void load_full_config_nvs(void)
             nvs_get_blob(my_handle, "mqtt_cfg", &s_mqtt_config, &required_size);
             ESP_LOGI(TAG, "Loaded mqtt config from NVS");
         }
+
+        required_size = 0;
+        if (nvs_get_blob(my_handle, "wifi_cfg", NULL, &required_size) == ESP_OK && required_size == sizeof(s_wifi_config)) {
+            nvs_get_blob(my_handle, "wifi_cfg", &s_wifi_config, &required_size);
+            ESP_LOGI(TAG, "Loaded wifi config from NVS");
+        }
         nvs_close(my_handle);
     }
+}
+
+/* Apply WiFi configuration changes immediately (reconnect with new settings) */
+static void apply_wifi_config(void)
+{
+    // Disconnect first
+    esp_wifi_disconnect();
+    
+    // Create ESP WiFi config struct from app settings
+    wifi_config_t esp_wifi_cfg = {
+        .sta = {
+            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+        },
+    };
+    strncpy((char*)esp_wifi_cfg.sta.ssid, s_wifi_config.ssid, sizeof(esp_wifi_cfg.sta.ssid) - 1);
+    strncpy((char*)esp_wifi_cfg.sta.password, s_wifi_config.password, sizeof(esp_wifi_cfg.sta.password) - 1);
+    
+    // Set WiFi config
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &esp_wifi_cfg));
+    
+    // Apply IP settings via netif
+    esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (netif) {
+        if (s_wifi_config.use_dhcp) {
+            esp_netif_dhcpc_stop(netif);
+            esp_netif_dhcpc_start(netif);
+            ESP_LOGI(TAG, "WiFi: DHCP enabled");
+        } else {
+            esp_netif_dhcpc_stop(netif);
+            esp_netif_ip_info_t ip_info;
+            esp_netif_str_to_ip4(s_wifi_config.static_ip, &ip_info.ip);
+            esp_netif_str_to_ip4(s_wifi_config.static_netmask, &ip_info.netmask);
+            esp_netif_str_to_ip4(s_wifi_config.static_gateway, &ip_info.gw);
+            esp_netif_set_ip_info(netif, &ip_info);
+            ESP_LOGI(TAG, "WiFi: Static IP %s set", s_wifi_config.static_ip);
+        }
+    }
+    
+    // Reconnect
+    esp_wifi_connect();
+    ESP_LOGI(TAG, "WiFi reconnecting with new config: %s", s_wifi_config.ssid);
+}
+
+/* Reboot the device */
+static esp_err_t api_reboot_handler(httpd_req_t *req)
+{
+    ESP_LOGI(TAG, "Reboot requested via web API");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, "{\"result\":\"rebooting\"}", HTTPD_RESP_USE_STRLEN);
+    
+    // Schedule reboot in 500ms to ensure response is sent
+    vTaskDelay(pdMS_TO_TICKS(500));
+    esp_restart();
+    return ESP_OK;
 }

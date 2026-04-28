@@ -10,10 +10,13 @@ h3{color:#34495e;margin-top:16px;margin-bottom:12px;font-size:18px}
 .form-group{margin-bottom:16px}
 label{display:block;margin-bottom:6px;font-weight:500;color:#555}
 input,textarea{padding:10px 12px;width:100%;border:1px solid #ddd;border-radius:4px;font-family:inherit;font-size:14px;transition:border-color 0.3s}
+input[type="checkbox"]{width:auto;margin-right:8px}
 input:focus,textarea:focus{outline:none;border-color:#3498db;box-shadow:0 0 0 3px rgba(52,152,219,0.1)}
 button{padding:10px 20px;background:#3498db;color:#fff;border:none;border-radius:4px;font-size:14px;font-weight:600;cursor:pointer;transition:background 0.3s;margin-top:12px}
 button:hover{background:#2980b9}
 button:active{transform:scale(0.98)}
+fieldset{border:1px solid #ddd;padding:12px;border-radius:4px;margin:12px 0}
+legend{padding:0 8px;font-weight:600;color:#34495e}
 .status{display:flex;gap:12px;margin-bottom:20px;flex-wrap:wrap}
 .status-item{display:flex;align-items:center;gap:6px;padding:8px 12px;background:#fff;border-radius:4px;box-shadow:0 1px 3px rgba(0,0,0,0.1)}
 .status-dot{width:10px;height:10px;border-radius:50%;display:inline-block}
