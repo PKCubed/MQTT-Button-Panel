@@ -15,6 +15,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "nvs_flash.h"
 
 #include "esp_http_server.h"
@@ -83,6 +84,7 @@ static const touch_pad_t k_touch_channels[BUTTON_COUNT] = {
 #define MAIN_BTN_COUNT 4
 #define BTN_BANK_DOWN 4
 #define BTN_BANK_UP 5
+#define CONFIG_FORMAT_VERSION 2
 
 typedef enum { BTN_TYPE_TOGGLE, BTN_TYPE_MOMENTARY, BTN_TYPE_RADIO } btn_type_t;
 
@@ -90,8 +92,8 @@ typedef struct {
     char display_name[17];
     char mqtt_topic[64];
     btn_type_t type;
-    uint8_t color_on[3];  // GRB
-    uint8_t color_off[3]; // GRB
+    uint8_t color_on[3];  // RGB
+    uint8_t color_off[3]; // RGB
     uint8_t radio_group;  // 0 means no group
 } button_config_t;
 
@@ -188,6 +190,34 @@ static int64_t s_button_last_change_ms[BUTTON_COUNT] = {0};
 /* Cache the last LCD output so we can avoid sending unchanged text over I2C. */
 static char s_lcd_last_line1[17] = {0};
 static char s_lcd_last_line2[17] = {0};
+static SemaphoreHandle_t s_i2c_mutex = NULL;
+static SemaphoreHandle_t s_lcd_mutex = NULL;
+
+/* Keep configuration within safe bounds even if NVS data is old/corrupt. */
+static void sanitize_config(void)
+{
+    if (s_config.num_banks < 1 || s_config.num_banks > MAX_BANKS) {
+        s_config.num_banks = 1;
+    }
+
+    s_config.panel_name[sizeof(s_config.panel_name) - 1] = '\0';
+
+    for (int b = 0; b < MAX_BANKS; ++b) {
+        s_config.banks[b].bank_name[sizeof(s_config.banks[b].bank_name) - 1] = '\0';
+        for (int i = 0; i < MAIN_BTN_COUNT; ++i) {
+            button_config_t *btn = &s_config.banks[b].buttons[i];
+            btn->display_name[sizeof(btn->display_name) - 1] = '\0';
+            btn->mqtt_topic[sizeof(btn->mqtt_topic) - 1] = '\0';
+            if (btn->type < BTN_TYPE_TOGGLE || btn->type > BTN_TYPE_RADIO) {
+                btn->type = BTN_TYPE_TOGGLE;
+            }
+        }
+    }
+
+    if (s_current_bank >= s_config.num_banks) {
+        s_current_bank = 0;
+    }
+}
 
 /* Queue-based redraw helper. MQTT callbacks run outside the logic task, so   */
 /* they request a refresh indirectly instead of touching UI state directly.   */
@@ -211,12 +241,28 @@ static int64_t now_ms(void)
 
 static esp_err_t i2c_write_u8(uint8_t addr, uint8_t value)
 {
-    return i2c_master_write_to_device(I2C_PORT, addr, &value, 1, pdMS_TO_TICKS(20));
+    if (s_i2c_mutex == NULL) {
+        return i2c_master_write_to_device(I2C_PORT, addr, &value, 1, pdMS_TO_TICKS(20));
+    }
+    if (xSemaphoreTake(s_i2c_mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    esp_err_t err = i2c_master_write_to_device(I2C_PORT, addr, &value, 1, pdMS_TO_TICKS(20));
+    xSemaphoreGive(s_i2c_mutex);
+    return err;
 }
 
 static esp_err_t i2c_read_u8(uint8_t addr, uint8_t *value)
 {
-    return i2c_master_read_from_device(I2C_PORT, addr, value, 1, pdMS_TO_TICKS(20));
+    if (s_i2c_mutex == NULL) {
+        return i2c_master_read_from_device(I2C_PORT, addr, value, 1, pdMS_TO_TICKS(20));
+    }
+    if (xSemaphoreTake(s_i2c_mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    esp_err_t err = i2c_master_read_from_device(I2C_PORT, addr, value, 1, pdMS_TO_TICKS(20));
+    xSemaphoreGive(s_i2c_mutex);
+    return err;
 }
 
 /* Bring-up helper for the shared I2C bus. It is left in the file because it  */
@@ -330,6 +376,12 @@ static esp_err_t lcd_write_line(uint8_t row, const char *line)
 /* Update both lines only when they actually changed.                         */
 static esp_err_t lcd_set_lines(const char *line1, const char *line2)
 {
+    if (s_lcd_mutex != NULL) {
+        if (xSemaphoreTake(s_lcd_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+            return ESP_ERR_TIMEOUT;
+        }
+    }
+
     char l1[17];
     char l2[17];
 
@@ -346,8 +398,15 @@ static esp_err_t lcd_set_lines(const char *line1, const char *line2)
     if (strncmp(l2, s_lcd_last_line2, 16) != 0) {
         esp_err_t err = lcd_write_line(1, l2);
         if (err != ESP_OK) {
+            if (s_lcd_mutex != NULL) {
+                xSemaphoreGive(s_lcd_mutex);
+            }
             return err;
         }
+    }
+
+    if (s_lcd_mutex != NULL) {
+        xSemaphoreGive(s_lcd_mutex);
     }
 
     return ESP_OK;
@@ -364,7 +423,20 @@ static esp_err_t i2c_init(void)
         .master.clk_speed = I2C_FREQ_HZ,
     };
     i2c_param_config(I2C_PORT, &conf);
-    return i2c_driver_install(I2C_PORT, conf.mode, 0, 0, 0);
+    esp_err_t err = i2c_driver_install(I2C_PORT, conf.mode, 0, 0, 0);
+    if (err == ESP_OK && s_i2c_mutex == NULL) {
+        s_i2c_mutex = xSemaphoreCreateMutex();
+        if (s_i2c_mutex == NULL) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    if (err == ESP_OK && s_lcd_mutex == NULL) {
+        s_lcd_mutex = xSemaphoreCreateMutex();
+        if (s_lcd_mutex == NULL) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    return err;
 }
 
 /* Standard HD44780 power-up sequence. The repeated 0x30 writes are deliberate */
@@ -374,6 +446,8 @@ static esp_err_t lcd_init(void)
 {
     // 1. Wait for LCD to fully power up (some clones need >50ms)
     vTaskDelay(pdMS_TO_TICKS(100)); 
+    lcd_expander_write(0x00);
+    vTaskDelay(pdMS_TO_TICKS(5));
     lcd_expander_write(LCD_PIN_BL);
     vTaskDelay(pdMS_TO_TICKS(10));
 
@@ -400,6 +474,10 @@ static esp_err_t lcd_init(void)
     // 6. Clear display (0x01)
     if (lcd_send(0x01, false) != ESP_OK) return ESP_FAIL;
     esp_rom_delay_us(5000); // Give it a full 5ms to clear!
+
+    // 6b. Home the cursor to make sure the LCD state machine is fully reset.
+    if (lcd_send(0x02, false) != ESP_OK) return ESP_FAIL;
+    esp_rom_delay_us(2000);
 
     // 7. Set Entry Mode: Increment, no shift (0x06)
     if (lcd_send(0x06, false) != ESP_OK) return ESP_FAIL;
@@ -752,9 +830,23 @@ static void init_network_failover(void) {
 
     esp_eth_config_t eth_config = ETH_DEFAULT_CONFIG(mac, phy);
     esp_eth_handle_t eth_handle = NULL;
-    ESP_ERROR_CHECK(esp_eth_driver_install(&eth_config, &eth_handle));
-    ESP_ERROR_CHECK(esp_netif_attach(eth_netif, esp_eth_new_netif_glue(eth_handle)));
+    esp_err_t _ret = esp_eth_driver_install(&eth_config, &eth_handle);
+    if (_ret != ESP_OK) {
+        ESP_LOGE(TAG, "esp_eth_driver_install failed: %s", esp_err_to_name(_ret));
+        gpio_set_level(ETH_PHY_POWER_GPIO, 0);
+        ESP_LOGW(TAG, "Falling back to Wi-Fi only (Ethernet disabled)");
+        goto wifi_only;
+    }
+    _ret = esp_netif_attach(eth_netif, esp_eth_new_netif_glue(eth_handle));
+    if (_ret != ESP_OK) {
+        ESP_LOGE(TAG, "esp_netif_attach failed: %s", esp_err_to_name(_ret));
+        esp_eth_driver_uninstall(eth_handle);
+        gpio_set_level(ETH_PHY_POWER_GPIO, 0);
+        ESP_LOGW(TAG, "Falling back to Wi-Fi only (Ethernet disabled)");
+        goto wifi_only;
+    }
 
+wifi_only:
     // Initialize Wi-Fi (Fallback)
     esp_netif_create_default_wifi_sta();
     wifi_init_config_t wifi_cfg = WIFI_INIT_CONFIG_DEFAULT();
@@ -798,7 +890,13 @@ static void init_network_failover(void) {
     esp_event_handler_register(IP_EVENT, ESP_EVENT_ANY_ID, &net_event_handler, NULL);
     esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &net_event_handler, NULL);
 
-    ESP_ERROR_CHECK(esp_eth_start(eth_handle));
+    _ret = esp_eth_start(eth_handle);
+    if (_ret != ESP_OK) {
+        ESP_LOGE(TAG, "esp_eth_start failed: %s", esp_err_to_name(_ret));
+        esp_eth_driver_uninstall(eth_handle);
+        gpio_set_level(ETH_PHY_POWER_GPIO, 0);
+        ESP_LOGW(TAG, "Ethernet start failed, continuing with Wi-Fi only");
+    }
 }
 
 /* ========================================================================== */
@@ -896,12 +994,13 @@ static void render_startup_frame(uint8_t phase)
     const uint8_t orange[3] = {255, 96, 0};
 
     uint8_t brightness = (uint8_t)((phase < 20 ? phase : 39 - phase) * 13);
-    rgb[BTN_BANK_DOWN][0] = (uint8_t)((orange[0] * brightness) / 255U);
-    rgb[BTN_BANK_DOWN][1] = (uint8_t)((orange[1] * brightness) / 255U);
-    rgb[BTN_BANK_DOWN][2] = (uint8_t)((orange[2] * brightness) / 255U);
-    rgb[BTN_BANK_UP][0] = rgb[BTN_BANK_DOWN][0];
-    rgb[BTN_BANK_UP][1] = rgb[BTN_BANK_DOWN][1];
-    rgb[BTN_BANK_UP][2] = rgb[BTN_BANK_DOWN][2];
+    
+    // Apply orange pulse to all LEDs
+    for (int i = 0; i < LED_COUNT; i++) {
+        rgb[i][0] = (uint8_t)((orange[0] * brightness) / 255U);
+        rgb[i][1] = (uint8_t)((orange[1] * brightness) / 255U);
+        rgb[i][2] = (uint8_t)((orange[2] * brightness) / 255U);
+    }
 
     ws2812_show(rgb);
 }
@@ -930,6 +1029,8 @@ static void startup_task(void *arg)
 /* connectivity, and held-button feedback into one consistent frame.         */
 static void update_system_ui(int touch_preview_idx)
 {
+    sanitize_config();
+
     char line1[32];
     char line2[32];
 
@@ -1080,28 +1181,37 @@ static void logic_task(void *arg)
                     bool *state = &s_btn_states[s_current_bank][evt.btn_idx];
 
                     if (evt.type == EVT_BTN_PRESSED) {
-                        // Each button type uses a different physical behavior.
+                        // Do NOT mutate local button state here. The panel's
+                        // visual state is authoritative from the broker via
+                        // the '<topic>/state' subscription. On press we only
+                        // publish to '<topic>/set' and let the state message
+                        // drive the color change when it arrives.
                         if (cfg->type == BTN_TYPE_TOGGLE) {
-                            *state = !(*state);
-                            publish_mqtt_state(s_current_bank, evt.btn_idx, *state);
-                        } 
-                        else if (cfg->type == BTN_TYPE_MOMENTARY) {
-                            *state = true;
+                            // For toggle, publish the desired toggle command.
+                            // We don't know the broker's current state here,
+                            // so we publish the inverse of our cached state
+                            // to request a flip; the broker will respond on
+                            // the /state topic and update us.
+                            publish_mqtt_state(s_current_bank, evt.btn_idx, !(*state));
+                        } else if (cfg->type == BTN_TYPE_MOMENTARY) {
+                            // Momentary: send ON on press; broker should emit
+                            // a state later and we'll update when /state arrives.
                             publish_mqtt_state(s_current_bank, evt.btn_idx, true);
-                        }
-                        else if (cfg->type == BTN_TYPE_RADIO) {
+                        } else if (cfg->type == BTN_TYPE_RADIO) {
+                            // Radio: request all peers in the group be turned
+                            // off, then request this button be turned on. We
+                            // publish the off commands (so remote actors change)
+                            // but DO NOT modify local cached state here.
                             for (int i = 0; i < MAIN_BTN_COUNT; i++) {
                                 if (s_config.banks[s_current_bank].buttons[i].radio_group == cfg->radio_group) {
-                                    s_btn_states[s_current_bank][i] = false;
                                     publish_mqtt_state(s_current_bank, i, false);
                                 }
                             }
-                            *state = true;
-                            publish_mqtt_state(s_current_bank, evt.btn_idx, true); 
+                            publish_mqtt_state(s_current_bank, evt.btn_idx, true);
                         }
                     } else if (evt.type == EVT_BTN_RELEASED) {
                         if (cfg->type == BTN_TYPE_MOMENTARY) {
-                            *state = false;
+                            // Send OFF on release for momentary buttons.
                             publish_mqtt_state(s_current_bank, evt.btn_idx, false);
                         }
                     }
@@ -1135,9 +1245,12 @@ static void hardware_task(void *arg)
                 bool was_pressed = ((s_button_last_state >> k_button_pcf_bits[i]) & 0x01) == 0;
 
                 if (is_pressed != was_pressed) {
-                    // Time-based debounce: only accept the edge if it has stayed
-                    // stable long enough to likely be a real press or release.
-                    if ((now_ms() - s_button_last_change_ms[i]) > 25) { 
+                    // Time-based debounce: accept the edge if it has stayed
+                    // stable longer than DEBOUNCE_MS, OR accept releases
+                    // immediately to avoid missed OFF commands on quick taps.
+                    const int DEBOUNCE_MS = 25;
+                    int64_t delta = now_ms() - s_button_last_change_ms[i];
+                    if (delta > DEBOUNCE_MS || (is_pressed == false)) {
                         input_event_t evt = {
                             .type = is_pressed ? EVT_BTN_PRESSED : EVT_BTN_RELEASED,
                             .btn_idx = i
@@ -1246,6 +1359,65 @@ static void load_full_config_nvs(void);
 static void apply_wifi_config(void);
 static esp_err_t api_reboot_handler(httpd_req_t *req);
 
+static bool mqtt_config_equal(const mqtt_config_t *a, const mqtt_config_t *b)
+{
+    return strcmp(a->broker_ip, b->broker_ip) == 0 &&
+           strcmp(a->port, b->port) == 0 &&
+           strcmp(a->username, b->username) == 0 &&
+           strcmp(a->password, b->password) == 0;
+}
+
+static bool wifi_config_equal(const app_wifi_config_t *a, const app_wifi_config_t *b)
+{
+    return strcmp(a->ssid, b->ssid) == 0 &&
+           strcmp(a->password, b->password) == 0 &&
+           a->use_dhcp == b->use_dhcp &&
+           strcmp(a->static_ip, b->static_ip) == 0 &&
+           strcmp(a->static_netmask, b->static_netmask) == 0 &&
+           strcmp(a->static_gateway, b->static_gateway) == 0;
+}
+
+static void migrate_grb_colors_to_rgb(void)
+{
+    for (int b = 0; b < MAX_BANKS; ++b) {
+        for (int i = 0; i < MAIN_BTN_COUNT; ++i) {
+            button_config_t *btn = &s_config.banks[b].buttons[i];
+            uint8_t tmp = btn->color_on[0];
+            btn->color_on[0] = btn->color_on[1];
+            btn->color_on[1] = tmp;
+            tmp = btn->color_off[0];
+            btn->color_off[0] = btn->color_off[1];
+            btn->color_off[1] = tmp;
+        }
+    }
+}
+
+/* Convert config RGB storage to API RGB array for web clients. */
+static cJSON *make_rgb_array_from_rgb(const uint8_t rgb[3])
+{
+    cJSON *arr = cJSON_CreateArray();
+    if (!arr) return NULL;
+    cJSON_AddItemToArray(arr, cJSON_CreateNumber(rgb[0]));
+    cJSON_AddItemToArray(arr, cJSON_CreateNumber(rgb[1]));
+    cJSON_AddItemToArray(arr, cJSON_CreateNumber(rgb[2]));
+    return arr;
+}
+
+/* Parse API RGB arrays into config RGB storage. */
+static void parse_rgb_array_to_rgb(cJSON *rgb_arr, uint8_t rgb_out[3])
+{
+    if (!cJSON_IsArray(rgb_arr) || cJSON_GetArraySize(rgb_arr) < 3) return;
+
+    cJSON *r = cJSON_GetArrayItem(rgb_arr, 0);
+    cJSON *g = cJSON_GetArrayItem(rgb_arr, 1);
+    cJSON *b = cJSON_GetArrayItem(rgb_arr, 2);
+    if (!cJSON_IsNumber(r) || !cJSON_IsNumber(g) || !cJSON_IsNumber(b)) return;
+
+    rgb_out[0] = (uint8_t)r->valueint;
+    rgb_out[1] = (uint8_t)g->valueint;
+    rgb_out[2] = (uint8_t)b->valueint;
+}
+
 
 /* JSON API: GET /api/config - returns the current system and mqtt config */
 static esp_err_t api_get_config_handler(httpd_req_t *req)
@@ -1285,8 +1457,8 @@ static esp_err_t api_get_config_handler(httpd_req_t *req)
             cJSON_AddNumberToObject(btn, "type", s_config.banks[b].buttons[i].type);
             cJSON_AddNumberToObject(btn, "radio_group", s_config.banks[b].buttons[i].radio_group);
 
-            cJSON *on = cJSON_CreateIntArray((const int*)s_config.banks[b].buttons[i].color_on, 3);
-            cJSON *off = cJSON_CreateIntArray((const int*)s_config.banks[b].buttons[i].color_off, 3);
+            cJSON *on = make_rgb_array_from_rgb(s_config.banks[b].buttons[i].color_on);
+            cJSON *off = make_rgb_array_from_rgb(s_config.banks[b].buttons[i].color_off);
             cJSON_AddItemToObject(btn, "color_on", on);
             cJSON_AddItemToObject(btn, "color_off", off);
 
@@ -1397,18 +1569,8 @@ static esp_err_t api_post_config_handler(httpd_req_t *req)
                     /* colors */
                     cJSON *co = cJSON_GetObjectItemCaseSensitive(bitem, "color_on");
                     cJSON *cf = cJSON_GetObjectItemCaseSensitive(bitem, "color_off");
-                    if (cJSON_IsArray(co) && cJSON_GetArraySize(co) >= 3) {
-                        for (int k=0;k<3;k++) {
-                            cJSON *n = cJSON_GetArrayItem(co,k);
-                            if (cJSON_IsNumber(n)) s_config.banks[bidx].buttons[bi].color_on[k] = (uint8_t)n->valueint;
-                        }
-                    }
-                    if (cJSON_IsArray(cf) && cJSON_GetArraySize(cf) >= 3) {
-                        for (int k=0;k<3;k++) {
-                            cJSON *n = cJSON_GetArrayItem(cf,k);
-                            if (cJSON_IsNumber(n)) s_config.banks[bidx].buttons[bi].color_off[k] = (uint8_t)n->valueint;
-                        }
-                    }
+                    parse_rgb_array_to_rgb(co, s_config.banks[bidx].buttons[bi].color_on);
+                    parse_rgb_array_to_rgb(cf, s_config.banks[bidx].buttons[bi].color_off);
 
                     bi++;
                 }
@@ -1417,10 +1579,27 @@ static esp_err_t api_post_config_handler(httpd_req_t *req)
         }
     }
 
-    /* Persist and apply */
+    sanitize_config();
+
+    mqtt_config_t prev_mqtt = s_mqtt_config;
+    app_wifi_config_t prev_wifi = s_wifi_config;
+
+    /* Persist changes. Only touch network state if those settings changed. */
     save_full_config_nvs();
-    apply_wifi_config();
-    start_mqtt();
+
+    bool mqtt_changed = !mqtt_config_equal(&prev_mqtt, &s_mqtt_config);
+    bool wifi_changed = !wifi_config_equal(&prev_wifi, &s_wifi_config);
+
+    if (mqtt_changed || wifi_changed) {
+        if (wifi_changed) {
+            apply_wifi_config();
+        }
+        if (mqtt_changed || wifi_changed) {
+            start_mqtt();
+        }
+    }
+
+    request_ui_refresh();
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, "{\"result\":\"ok\"}", HTTPD_RESP_USE_STRLEN);
@@ -1593,6 +1772,8 @@ static void save_full_config_nvs(void)
 {
     nvs_handle_t my_handle;
     if (nvs_open("storage", NVS_READWRITE, &my_handle) == ESP_OK) {
+        uint32_t cfg_version = CONFIG_FORMAT_VERSION;
+        nvs_set_u32(my_handle, "cfg_ver", cfg_version);
         nvs_set_blob(my_handle, "sys_cfg", &s_config, sizeof(s_config));
         nvs_set_blob(my_handle, "mqtt_cfg", &s_mqtt_config, sizeof(s_mqtt_config));
         nvs_set_blob(my_handle, "wifi_cfg", &s_wifi_config, sizeof(s_wifi_config));
@@ -1606,6 +1787,11 @@ static void load_full_config_nvs(void)
 {
     nvs_handle_t my_handle;
     if (nvs_open("storage", NVS_READONLY, &my_handle) == ESP_OK) {
+        uint32_t cfg_version = 0;
+        if (nvs_get_u32(my_handle, "cfg_ver", &cfg_version) != ESP_OK) {
+            cfg_version = 0;
+        }
+
         size_t required_size = 0;
         if (nvs_get_blob(my_handle, "sys_cfg", NULL, &required_size) == ESP_OK && required_size == sizeof(s_config)) {
             nvs_get_blob(my_handle, "sys_cfg", &s_config, &required_size);
@@ -1624,7 +1810,15 @@ static void load_full_config_nvs(void)
             ESP_LOGI(TAG, "Loaded wifi config from NVS");
         }
         nvs_close(my_handle);
+
+        if (cfg_version < CONFIG_FORMAT_VERSION) {
+            migrate_grb_colors_to_rgb();
+            save_full_config_nvs();
+            ESP_LOGI(TAG, "Migrated LED colors to RGB config format");
+        }
     }
+
+    sanitize_config();
 }
 
 /* Apply WiFi configuration changes immediately (reconnect with new settings) */

@@ -34,6 +34,45 @@
       </div>
     </div>
 
+    <div class="config-section">
+      <h3>Configuration Export/Import</h3>
+      <p style="color:#666;font-size:13px;margin-bottom:12px;">
+        <strong>Export:</strong> Download complete config as JSON. <strong>Import:</strong> Upload a saved config and select where to apply it.
+      </p>
+      <div style="display:flex;gap:12px;flex-wrap:wrap;">
+        <button type="button" id="export-all-btn" class="btn-small">Export Everything</button>
+        <button type="button" id="import-file-btn" class="btn-small">Import Config (File)</button>
+        <input type="file" id="file-import-input" accept=".json" style="display:none;">
+      </div>
+      <div id="import-dialog" style="display:none;margin-top:16px;padding:16px;border:1px solid #ccc;border-radius:4px;background:#f9f9f9;">
+        <h4 style="margin-top:0;">Where to Import?</h4>
+        <label style="display:block;margin:8px 0;">
+          <input type="radio" name="import-mode" value="all" checked> Replace entire config
+        </label>
+        <label style="display:block;margin:8px 0;">
+          <input type="radio" name="import-mode" value="bank"> Replace a specific bank:
+          <select id="import-bank-select" style="margin-left:8px;padding:4px;" disabled>
+            <option>Select bank...</option>
+          </select>
+        </label>
+        <label style="display:block;margin:8px 0;">
+          <input type="radio" name="import-mode" value="button"> Replace a specific button:
+          <div style="margin-left:20px;margin-top:8px;">
+            Bank: <select id="import-bank-for-button" style="padding:4px;" disabled>
+              <option>Select bank...</option>
+            </select>
+            Button: <select id="import-button-select" style="padding:4px;margin-left:8px;" disabled>
+              <option>Select button...</option>
+            </select>
+          </div>
+        </label>
+        <div style="margin-top:16px;display:flex;gap:8px;">
+          <button type="button" id="import-confirm-btn" class="btn-small">Confirm Import</button>
+          <button type="button" id="import-cancel-btn" class="btn-small" style="background:#ccc;">Cancel</button>
+        </div>
+      </div>
+    </div>
+
     <div id="banks-container" style="margin-top:24px;">
       <!-- Banks will be populated here -->
     </div>
@@ -162,22 +201,265 @@
         });
       });
 
-      // Copy/paste logic
-      let copyBuffer = null;
+      // Copy/paste logic: system clipboard (works cross-panel, cross-IP)
       document.querySelectorAll('.copy-btn').forEach(btn => {
-        btn.addEventListener('click', (e) => {
+        btn.addEventListener('click', async (e) => {
           const card = e.target.closest('.button-card');
-          copyBuffer = collectButtonCard(card);
-          showAlert('Button copied to clipboard', 'success');
+          const buttonData = collectButtonCard(card);
+          const payload = serializeButtonPayload(buttonData);
+          
+          // Primary: system clipboard (works cross-panel in same browser)
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            try {
+              await navigator.clipboard.writeText(payload);
+              showAlert('✓ Button copied to clipboard (works cross-panel)', 'success');
+              return;
+            } catch (err) {
+              showAlert(`⚠ Clipboard denied: ${err.message}. Try Export instead.`, 'error');
+              return;
+            }
+          }
+          showAlert('⚠ Clipboard API unavailable. Use Export/Import buttons.', 'error');
         });
       });
+      
       document.querySelectorAll('.paste-btn').forEach(btn => {
         btn.addEventListener('click', async (e) => {
-          if (!copyBuffer) { showAlert('Nothing to paste', 'error'); return; }
+          if (!navigator.clipboard || !navigator.clipboard.readText) {
+            showAlert('⚠ Clipboard API unavailable. Use Import button instead.', 'error');
+            return;
+          }
+          
+          let data = null;
+          try {
+            const clipText = await navigator.clipboard.readText();
+            data = deserializeButtonPayload(clipText);
+          } catch (err) {
+            showAlert(`⚠ Clipboard denied: ${err.message}. Try Import instead.`, 'error');
+            return;
+          }
+          
+          if (!data) {
+            showAlert('✗ Clipboard is empty. Copy a button first.', 'error');
+            return;
+          }
+          
           const card = e.target.closest('.button-card');
-          applyButtonCard(card, copyBuffer);
-          showAlert('Pasted settings to button (save to persist)', 'success');
+          applyButtonCard(card, data);
+          showAlert('✓ Pasted settings to button (save to persist)', 'success');
         });
+      });
+      
+      // Export ALL config: download complete config as JSON file
+      document.getElementById('export-all-btn').addEventListener('click', () => {
+        // Collect current config from UI
+        const fullCfg = {
+          type: 'mqtt-panel-config-v1',
+          data: {
+            panel_name: document.getElementById('panel-name-input').value,
+            num_banks: parseInt(document.getElementById('num-banks-input').value),
+            banks: []
+          }
+        };
+        
+        document.querySelectorAll('.bank-card').forEach((bankDiv, b) => {
+          const bank = {
+            bank_name: bankDiv.querySelector('.bank-name').value,
+            buttons: []
+          };
+          bankDiv.querySelectorAll('.button-card').forEach((btnDiv) => {
+            bank.buttons.push(collectButtonCard(btnDiv));
+          });
+          fullCfg.data.banks.push(bank);
+        });
+        
+        const payload = JSON.stringify(fullCfg, null, 2);
+        const blob = new Blob([payload], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = 'panel-config-export.json';
+        link.click();
+        URL.revokeObjectURL(url);
+        showAlert('✓ Full config exported to panel-config-export.json', 'success');
+      });
+      
+      // Import button: upload config from JSON file
+      let pendingImportConfig = null;
+      document.getElementById('import-file-btn').addEventListener('click', () => {
+        document.getElementById('file-import-input').click();
+      });
+      
+      document.getElementById('file-import-input').addEventListener('change', (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = (ev) => {
+          try {
+            const payload = ev.target.result;
+            const parsed = JSON.parse(payload);
+            
+            // Detect format: single button or full config
+            let importData = null;
+            if (parsed && parsed.type === 'mqtt-button-config-v1' && parsed.data) {
+              // Single button format
+              importData = { type: 'button', data: parsed.data };
+            } else if (parsed && parsed.type === 'mqtt-panel-config-v1' && parsed.data) {
+              // Full config format
+              importData = { type: 'panel', data: parsed.data };
+            } else {
+              showAlert('✗ Unknown config file format', 'error');
+              e.target.value = '';
+              return;
+            }
+            
+            pendingImportConfig = importData;
+            
+            // Show import dialog and populate bank/button selects
+            const dialog = document.getElementById('import-dialog');
+            dialog.style.display = 'block';
+            
+            // Get bank list from current UI
+            const bankCards = document.querySelectorAll('.bank-card');
+            const bankSelects = [
+              document.getElementById('import-bank-select'),
+              document.getElementById('import-bank-for-button')
+            ];
+            
+            bankSelects.forEach(sel => {
+              sel.innerHTML = '<option>Select bank...</option>';
+              bankCards.forEach((card, idx) => {
+                const bankName = card.querySelector('.bank-name').value || `Bank ${idx + 1}`;
+                const opt = document.createElement('option');
+                opt.value = idx;
+                opt.textContent = `Bank ${idx + 1}: ${bankName}`;
+                sel.appendChild(opt);
+              });
+              sel.disabled = true;
+            });
+            
+            document.getElementById('import-button-select').innerHTML = '<option>Select button...</option>';
+            document.getElementById('import-button-select').disabled = true;
+            
+            // Wire up mode change to enable/disable selects
+            document.querySelectorAll('input[name="import-mode"]').forEach(radio => {
+              radio.addEventListener('change', () => {
+                document.getElementById('import-bank-select').disabled = radio.value !== 'bank';
+                document.getElementById('import-bank-for-button').disabled = radio.value !== 'button';
+                document.getElementById('import-button-select').disabled = radio.value !== 'button';
+              });
+            });
+            
+            // Wire up bank select for button import to populate button list
+            document.getElementById('import-bank-for-button').addEventListener('change', (evt) => {
+              const bankIdx = parseInt(evt.target.value);
+              const bankCard = document.querySelectorAll('.bank-card')[bankIdx];
+              const buttonSelect = document.getElementById('import-button-select');
+              buttonSelect.innerHTML = '<option>Select button...</option>';
+              if (bankCard) {
+                const buttonCards = bankCard.querySelectorAll('.button-card');
+                buttonCards.forEach((card, bidx) => {
+                  const btnName = card.querySelector('.btn-name').value || `Button ${bidx + 1}`;
+                  const opt = document.createElement('option');
+                  opt.value = bidx;
+                  opt.textContent = `Button ${bidx + 1}: ${btnName}`;
+                  buttonSelect.appendChild(opt);
+                });
+              }
+            });
+            
+          } catch (err) {
+            showAlert(`✗ Error reading file: ${err.message}`, 'error');
+          }
+          e.target.value = '';
+        };
+        reader.readAsText(file);
+      });
+      
+      // Import dialog: confirm button
+      document.getElementById('import-confirm-btn').addEventListener('click', () => {
+        if (!pendingImportConfig) {
+          showAlert('✗ No config loaded', 'error');
+          return;
+        }
+        
+        const mode = document.querySelector('input[name="import-mode"]:checked').value;
+        const dialog = document.getElementById('import-dialog');
+        dialog.style.display = 'none';
+        
+        if (pendingImportConfig.type === 'button') {
+          // Single button: apply to first button
+          const firstCard = document.querySelector('.button-card');
+          if (firstCard) {
+            applyButtonCard(firstCard, pendingImportConfig.data);
+            showAlert('✓ Imported button config (save to persist)', 'success');
+          }
+        } else if (pendingImportConfig.type === 'panel') {
+          const cfgData = pendingImportConfig.data;
+          
+          if (mode === 'all') {
+            // Replace entire config: use existing renderer to ensure consistent layout
+            if (cfgData.panel_name) {
+              document.getElementById('panel-name-input').value = cfgData.panel_name;
+            }
+            if (cfgData.num_banks && cfgData.banks.length > 0) {
+              document.getElementById('num-banks-input').value = cfgData.num_banks;
+              // Render using the centralized renderer so color layout matches
+              renderBanksUI({ num_banks: cfgData.num_banks, banks: cfgData.banks });
+              showAlert('✓ Imported entire config (save to persist)', 'success');
+            }
+          } else if (mode === 'bank') {
+            // Replace specific bank
+            const bankIdx = parseInt(document.getElementById('import-bank-select').value);
+            if (isNaN(bankIdx)) {
+              showAlert('✗ Please select a bank', 'error');
+              return;
+            }
+            if (cfgData.banks && cfgData.banks[0]) {
+              const bankCards = document.querySelectorAll('.bank-card');
+              const targetBank = bankCards[bankIdx];
+              if (targetBank) {
+                targetBank.querySelector('.bank-name').value = cfgData.banks[0].bank_name || `Bank ${bankIdx + 1}`;
+                cfgData.banks[0].buttons.forEach((btn, bidx) => {
+                  const cards = targetBank.querySelectorAll('.button-card');
+                  if (cards[bidx]) {
+                    applyButtonCard(cards[bidx], btn);
+                  }
+                });
+                showAlert(`✓ Imported bank to Bank ${bankIdx + 1} (save to persist)`, 'success');
+              }
+            }
+          } else if (mode === 'button') {
+            // Replace specific button
+            const bankIdx = parseInt(document.getElementById('import-bank-for-button').value);
+            const buttonIdx = parseInt(document.getElementById('import-button-select').value);
+            if (isNaN(bankIdx) || isNaN(buttonIdx)) {
+              showAlert('✗ Please select a bank and button', 'error');
+              return;
+            }
+            if (cfgData.banks && cfgData.banks[0] && cfgData.banks[0].buttons[0]) {
+              const bankCards = document.querySelectorAll('.bank-card');
+              const targetBank = bankCards[bankIdx];
+              if (targetBank) {
+                const buttons = targetBank.querySelectorAll('.button-card');
+                if (buttons[buttonIdx]) {
+                  applyButtonCard(buttons[buttonIdx], cfgData.banks[0].buttons[0]);
+                  showAlert(`✓ Imported button to Bank ${bankIdx + 1}, Button ${buttonIdx + 1} (save to persist)`, 'success');
+                }
+              }
+            }
+          }
+        }
+        
+        pendingImportConfig = null;
+      });
+      
+      // Import dialog: cancel button
+      document.getElementById('import-cancel-btn').addEventListener('click', () => {
+        const dialog = document.getElementById('import-dialog');
+        dialog.style.display = 'none';
+        pendingImportConfig = null;
+        showAlert('✗ Import cancelled', 'error');
       });
     }
     
@@ -254,13 +536,40 @@
       };
     }
 
+    function serializeButtonPayload(data) {
+      return JSON.stringify({
+        type: 'mqtt-button-config-v1',
+        data
+      });
+    }
+
+    function deserializeButtonPayload(raw) {
+      if (!raw || typeof raw !== 'string') return null;
+      try {
+        const parsed = JSON.parse(raw);
+        if (parsed && parsed.type === 'mqtt-button-config-v1' && parsed.data) {
+          return parsed.data;
+        }
+      } catch (_) {
+        return null;
+      }
+      return null;
+    }
+
     function applyButtonCard(card, data) {
       card.querySelector('.btn-name').value = data.display_name || '';
       card.querySelector('.btn-topic').value = data.mqtt_topic || '';
       card.querySelector('.btn-type').value = String(data.type || 0);
-      const rg = card.querySelector('.btn-radio-group'); if (rg) rg.value = data.radio_group || 0;
+      const rg = card.querySelector('.btn-radio-group'); 
+      if (rg) rg.value = data.radio_group || 0;
       card.querySelector('.btn-color-on').value = `#${toHex(data.color_on || [0,0,0])}`;
       card.querySelector('.btn-color-off').value = `#${toHex(data.color_off || [0,0,0])}`;
+      
+      // Toggle radio group visibility based on button type
+      const rgField = card.querySelector('.btn-radio-group')?.parentElement;
+      if (rgField) {
+        rgField.classList.toggle('hidden', data.type !== 2);
+      }
     }
     
     function showAlert(msg, type) {
