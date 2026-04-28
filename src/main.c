@@ -26,7 +26,13 @@ static esp_mqtt_client_handle_t s_mqtt_client = NULL;
 #define ARRAY_LEN(x) (sizeof(x) / sizeof((x)[0]))
 static const char *TAG = "panel_main";
 
-/* --- Hardware Definitions (from your test code) --- */
+/* -------------------------------------------------------------------------- */
+/* Hardware mapping                                                           */
+/*                                                                            */
+/* These values describe the board wiring. Keeping them centralized makes it  */
+/* easier to change hardware without chasing pin numbers through the rest of  */
+/* the code.                                                                  */
+/* -------------------------------------------------------------------------- */
 #define ETH_PHY_ADDR 1
 #define ETH_PHY_RST_GPIO -1
 #define ETH_MDC_GPIO 23
@@ -64,7 +70,12 @@ static const touch_pad_t k_touch_channels[BUTTON_COUNT] = {
 #define WS2812_T1L_TICKS 24
 #define WS2812_RESET_TICKS 2400
 
-/* --- System Configuration Structures --- */
+/* -------------------------------------------------------------------------- */
+/* Panel configuration model                                                  */
+/*                                                                            */
+/* The runtime UI is driven by a small in-memory description of the panel:    */
+/* banks, buttons, MQTT topics, and LED colors.                               */
+/* -------------------------------------------------------------------------- */
 #define MAX_BANKS 4
 #define MAIN_BTN_COUNT 4
 #define BTN_BANK_DOWN 4
@@ -99,7 +110,8 @@ typedef struct {
     char password[64];
 } mqtt_config_t;
 
-// Add this alongside your other static variables
+/* Default MQTT settings are loaded into RAM first, then overwritten from     */
+/* NVS if the user has already saved values from the web UI.                  */
 static mqtt_config_t s_mqtt_config = {
     .broker_ip = "192.168.1.100",
     .port = "1883",
@@ -107,19 +119,28 @@ static mqtt_config_t s_mqtt_config = {
     .password = ""
 };
 
-/* --- Global State --- */
+/* -------------------------------------------------------------------------- */
+/* Runtime state                                                              */
+/*                                                                            */
+/* These globals are intentionally split between persistent configuration     */
+/* and live state. The hardware task only reports changes; the logic task      */
+/* decides what those changes mean for the UI and MQTT state.                 */
+/* -------------------------------------------------------------------------- */
 static system_config_t s_config;
 static uint8_t s_current_bank = 0;
 static bool s_btn_states[MAX_BANKS][MAIN_BTN_COUNT] = {false}; // Logical states (ON/OFF)
 static bool s_in_menu = false;
 static bool s_mqtt_connected = false;
+/* Startup animation keeps running until boot is fully complete.              */
 static bool s_startup_complete = false;
+static bool s_bank_btns_held[2] = {false, false};
 
-// Network status
+/* Connection flags let the UI decide whether to show online/offline cues     */
+/* without needing to query the networking stack repeatedly.                  */
 static bool s_eth_connected = false;
 static bool s_wifi_connected = false;
 
-// Queues for inter-task communication
+/* Input events are funneled through a queue so the tasks stay decoupled.     */
 static QueueHandle_t s_btn_event_queue;
 
 typedef enum { EVT_BTN_PRESSED, EVT_BTN_RELEASED, EVT_TOUCH_START, EVT_TOUCH_END, EVT_MQTT_SYNC } event_type_t;
@@ -129,10 +150,12 @@ typedef struct {
 } input_event_t;
 
 
+/* RMT frame buffer used to encode one WS2812 LED update.                     */
 static rmt_item32_t s_led_items[(LED_COUNT * 24) + 1];
 static bool s_eth_link = false;
 static bool s_eth_has_ip = false;
 
+/* Touch sensing is based on a baseline captured at boot.                    */
 static uint16_t s_touch_baseline[BUTTON_COUNT] = {0};
 static bool s_touch_ready = false;
 
@@ -140,9 +163,12 @@ static uint8_t s_button_state = 0xFF;
 static uint8_t s_button_last_state = 0xFF;
 static int64_t s_button_last_change_ms[BUTTON_COUNT] = {0};
 
+/* Cache the last LCD output so we can avoid sending unchanged text over I2C. */
 static char s_lcd_last_line1[17] = {0};
 static char s_lcd_last_line2[17] = {0};
 
+/* Queue-based redraw helper. MQTT callbacks run outside the logic task, so   */
+/* they request a refresh indirectly instead of touching UI state directly.   */
 static void request_ui_refresh(void)
 {
     if (s_btn_event_queue != NULL) {
@@ -155,6 +181,7 @@ static void request_ui_refresh(void)
 }
 
 
+/* Keep all timing math in milliseconds for readability.                     */
 static int64_t now_ms(void)
 {
     return esp_timer_get_time() / 1000;
@@ -170,6 +197,8 @@ static esp_err_t i2c_read_u8(uint8_t addr, uint8_t *value)
     return i2c_master_read_from_device(I2C_PORT, addr, value, 1, pdMS_TO_TICKS(20));
 }
 
+/* Bring-up helper for the shared I2C bus. It is left in the file because it  */
+/* is still useful when a peripheral disappears or a cable change is made.    */
 static void i2c_scan_log(void)
 {
     ESP_LOGI(TAG, "I2C scan started");
@@ -197,6 +226,8 @@ static esp_err_t lcd_expander_write(uint8_t value)
     return i2c_write_u8(PCF_LCD_ADDR, value);
 }
 
+/* The LCD is driven in 4-bit mode through the I/O expander, so each nibble   */
+/* becomes a small enable pulse while keeping the backlight bit intact.       */
 static esp_err_t lcd_write4_raw(uint8_t nibble_with_flags)
 {
     esp_err_t err = lcd_expander_write(nibble_with_flags | LCD_PIN_BL);
@@ -215,6 +246,7 @@ static esp_err_t lcd_write4_raw(uint8_t nibble_with_flags)
     return err;
 }
 
+/* Send a command or data byte as two LCD nibbles.                           */
 static esp_err_t lcd_send(uint8_t value, bool is_data)
 {
     uint8_t rs = is_data ? LCD_PIN_RS : 0;
@@ -237,6 +269,7 @@ static esp_err_t lcd_set_cursor(uint8_t row, uint8_t col)
     return lcd_send((uint8_t)(0x80 | (row_addr[row] + col)), false);
 }
 
+/* Write one fixed-width LCD line and remember what was last displayed.       */
 static esp_err_t lcd_write_line(uint8_t row, const char *line)
 {
     char padded[17];
@@ -272,6 +305,7 @@ static esp_err_t lcd_write_line(uint8_t row, const char *line)
     return ESP_OK;
 }
 
+/* Update both lines only when they actually changed.                         */
 static esp_err_t lcd_set_lines(const char *line1, const char *line2)
 {
     char l1[17];
@@ -311,6 +345,9 @@ static esp_err_t i2c_init(void)
     return i2c_driver_install(I2C_PORT, conf.mode, 0, 0, 0);
 }
 
+/* Standard HD44780 power-up sequence. The repeated 0x30 writes are deliberate */
+/* because they force the controller into a known state even if power timing   */
+/* is imperfect.                                                              */
 static esp_err_t lcd_init(void)
 {
     // 1. Wait for LCD to fully power up (some clones need >50ms)
@@ -385,6 +422,8 @@ static void ws2812_encode_byte(uint8_t byte, size_t *idx)
     }
 }
 
+/* Encode and transmit one frame to the LED strip. Keeping this separate      */
+/* from the UI logic makes it easy to repaint the LEDs from any event.        */
 static esp_err_t ws2812_show(const uint8_t rgb[LED_COUNT][3])
 {
     size_t idx = 0;
@@ -409,6 +448,8 @@ static esp_err_t ws2812_show(const uint8_t rgb[LED_COUNT][3])
     return err;
 }
 
+/* PCF8574 inputs are quasi-bidirectional, so writing 1 leaves the pin high    */
+/* and lets a button press pull it low.                                       */
 static esp_err_t buttons_init(void)
 {
     /* PCF8574 pins are quasi-bidirectional; writing 1 lets pin float high for input mode. */
@@ -420,6 +461,8 @@ static esp_err_t buttons_read_raw(uint8_t *state)
     return i2c_read_u8(PCF_BUTTON_ADDR, state);
 }
 
+/* Touch pads are calibrated at boot so the threshold can be relative rather   */
+/* than absolute. This makes the touch detection less sensitive to drift.     */
 static esp_err_t touch_init_all(void)
 {
     esp_err_t err = touch_pad_init();
@@ -471,6 +514,8 @@ static void touch_read_all(uint16_t out_values[BUTTON_COUNT])
     }
 }
 
+/* Touch is considered active when the filtered reading drops enough below    */
+/* the stored baseline.                                                       */
 static bool touch_is_active(size_t idx, uint16_t current)
 {
     if (!s_touch_ready || idx >= BUTTON_COUNT) {
@@ -488,6 +533,9 @@ static bool touch_is_active(size_t idx, uint16_t current)
 }
 
 
+/* MQTT events update the connection flag, subscriptions, and mirrored button  */
+/* state. The handler is intentionally thin so the logic task still owns UI    */
+/* decisions.                                                                 */
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data) {
     esp_mqtt_event_handle_t event = event_data;
     
@@ -549,6 +597,8 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     }
 }
 
+/* Recreate the MQTT client whenever the network comes back so we never reuse  */
+/* a stale client after a link bounce.                                         */
 static void start_mqtt(void) {
     // Prevent starting multiple clients if network bounces
     if (s_mqtt_client != NULL) {
@@ -579,6 +629,7 @@ static void start_mqtt(void) {
     esp_mqtt_client_start(s_mqtt_client);
 }
 
+/* Publish the logical button state, but only when MQTT is actually up.       */
 static void publish_mqtt_state(uint8_t bank, uint8_t btn, bool state) {
     if (!s_mqtt_client || !s_mqtt_connected) return; // Fail gracefully if not connected
     
@@ -593,6 +644,8 @@ static void publish_mqtt_state(uint8_t bank, uint8_t btn, bool state) {
 
 
 // Network Event Handler
+/* Ethernet is preferred, Wi-Fi is the fallback. This handler reacts to both   */
+/* stacks so the panel can stay reachable when one transport drops.           */
 static void net_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data) {
     if (event_base == ETH_EVENT) {
         switch (event_id) {
@@ -629,6 +682,8 @@ static void net_event_handler(void *arg, esp_event_base_t event_base, int32_t ev
 }
 
 // WT32-ETH01 Init (ESP-IDF v5.x compatible)
+/* Bring up WT32-ETH01 networking. The explicit delays are intentional so the */
+/* external PHY has time to boot before the MAC starts talking to it.         */
 static void init_network_failover(void) {
     // 1. Power up the PHY and WAIT
     ESP_ERROR_CHECK(gpio_set_direction(ETH_PHY_POWER_GPIO, GPIO_MODE_OUTPUT));
@@ -685,6 +740,7 @@ static void init_network_failover(void) {
 /* Application Logic                                                          */
 /* ========================================================================== */
 
+/* Persist the MQTT settings so the web UI survives a reboot.                */
 static void save_settings_nvs(void)
 {
     nvs_handle_t my_handle;
@@ -699,6 +755,7 @@ static void save_settings_nvs(void)
     }
 }
 
+/* Load saved MQTT settings if they exist; otherwise the defaults remain.    */
 static void load_settings_nvs(void)
 {
     nvs_handle_t my_handle;
@@ -722,6 +779,7 @@ static void load_settings_nvs(void)
     }
 }
 
+/* Hard-coded demo panel layout used until a full configuration editor exists. */
 static void load_default_config(void)
 {
     snprintf(s_config.panel_name, sizeof(s_config.panel_name), "Sanctuary Ltg");
@@ -765,6 +823,8 @@ static void load_default_config(void)
     }
 }
 
+/* Build one frame of the orange boot pulse. Only the bank buttons are lit so */
+/* the startup state is obvious without pretending the panel is usable yet.   */
 static void render_startup_frame(uint8_t phase)
 {
     uint8_t rgb[LED_COUNT][3] = {0};
@@ -781,6 +841,8 @@ static void render_startup_frame(uint8_t phase)
     ws2812_show(rgb);
 }
 
+/* Startup animation runs in its own task so it can keep pulsing while the    */
+/* rest of boot continues. The task deletes itself once boot is complete.     */
 static void startup_task(void *arg)
 {
     uint8_t phase = 0;
@@ -799,6 +861,8 @@ static void startup_task(void *arg)
     vTaskDelete(NULL);
 }
 
+/* Central UI renderer. It combines bank selection, touch preview, MQTT       */
+/* connectivity, and held-button feedback into one consistent frame.         */
 static void update_system_ui(int touch_preview_idx)
 {
     char line1[32];
@@ -837,14 +901,34 @@ static void update_system_ui(int touch_preview_idx)
             }
         }
 
-        // Keep the bank buttons visible during normal operation.
-        rgb[BTN_BANK_DOWN][0] = 48; rgb[BTN_BANK_DOWN][1] = 48; rgb[BTN_BANK_DOWN][2] = 48;
-        rgb[BTN_BANK_UP][0] = 48; rgb[BTN_BANK_UP][1] = 48; rgb[BTN_BANK_UP][2] = 48;
+        // The bank buttons are navigation controls, so we keep them visible.
+        // They turn red while held to make the press feel immediate.
+        if (s_bank_btns_held[0]) {
+            rgb[BTN_BANK_DOWN][0] = 255; rgb[BTN_BANK_DOWN][1] = 0; rgb[BTN_BANK_DOWN][2] = 0;
+        } else {
+            rgb[BTN_BANK_DOWN][0] = 48; rgb[BTN_BANK_DOWN][1] = 48; rgb[BTN_BANK_DOWN][2] = 48;
+        }
+
+        if (s_bank_btns_held[1]) {
+            rgb[BTN_BANK_UP][0] = 255; rgb[BTN_BANK_UP][1] = 0; rgb[BTN_BANK_UP][2] = 0;
+        } else {
+            rgb[BTN_BANK_UP][0] = 48; rgb[BTN_BANK_UP][1] = 48; rgb[BTN_BANK_UP][2] = 48;
+        }
+    } else if (s_bank_btns_held[0] || s_bank_btns_held[1]) {
+        // Even if MQTT is offline, still reflect the physical press state.
+        if (s_bank_btns_held[0]) {
+            rgb[BTN_BANK_DOWN][0] = 255; rgb[BTN_BANK_DOWN][1] = 0; rgb[BTN_BANK_DOWN][2] = 0;
+        }
+        if (s_bank_btns_held[1]) {
+            rgb[BTN_BANK_UP][0] = 255; rgb[BTN_BANK_UP][1] = 0; rgb[BTN_BANK_UP][2] = 0;
+        }
     }
 
     ws2812_show(rgb);
 }
 
+/* Track all active touches and restore the most recent surviving touch when   */
+/* another finger lifts. This keeps the LCD preview stable during multi-touch. */
 static void refresh_touch_preview(int *current_touch_preview, bool touch_active[MAIN_BTN_COUNT], uint32_t touch_order[MAIN_BTN_COUNT])
 {
     int next_preview = -1;
@@ -867,6 +951,8 @@ static void refresh_touch_preview(int *current_touch_preview, bool touch_active[
     }
 }
 
+/* Main state machine. This task receives all input events, mutates logical    */
+/* button state, manages bank changes, and triggers UI refreshes.             */
 static void logic_task(void *arg)
 {
     input_event_t evt;
@@ -875,7 +961,6 @@ static void logic_task(void *arg)
     uint32_t touch_order[MAIN_BTN_COUNT] = {0};
     uint32_t touch_seq = 0;
     int64_t menu_timer_start = 0;
-    bool bank_btns_held[2] = {false, false};
 
     update_system_ui(-1);
 
@@ -888,23 +973,26 @@ static void logic_task(void *arg)
 
             if (evt.btn_idx == BTN_BANK_DOWN || evt.btn_idx == BTN_BANK_UP) {
                 if (evt.type == EVT_BTN_PRESSED) {
-                    bank_btns_held[evt.btn_idx - BTN_BANK_DOWN] = true;
-                    if (bank_btns_held[0] && bank_btns_held[1]) {
+                    s_bank_btns_held[evt.btn_idx - BTN_BANK_DOWN] = true;
+                    if (s_bank_btns_held[0] && s_bank_btns_held[1]) {
                         menu_timer_start = now_ms();
                     }
+                    update_system_ui(current_touch_preview);
                 } else if (evt.type == EVT_BTN_RELEASED) {
-                    bank_btns_held[evt.btn_idx - BTN_BANK_DOWN] = false;
+                    s_bank_btns_held[evt.btn_idx - BTN_BANK_DOWN] = false;
                     menu_timer_start = 0;
 
                     if (!s_in_menu) {
                         if (evt.btn_idx == BTN_BANK_UP && s_current_bank < s_config.num_banks - 1) s_current_bank++;
                         if (evt.btn_idx == BTN_BANK_DOWN && s_current_bank > 0) s_current_bank--;
-                        update_system_ui(current_touch_preview);
                     }
+
+                    update_system_ui(current_touch_preview);
                 }
             }
 
             if (evt.type == EVT_TOUCH_START && evt.btn_idx < MAIN_BTN_COUNT) {
+                // Record touch order so the last surviving touch can be restored.
                 touch_active[evt.btn_idx] = true;
                 touch_order[evt.btn_idx] = ++touch_seq;
             } else if (evt.type == EVT_TOUCH_END && evt.btn_idx < MAIN_BTN_COUNT) {
@@ -916,6 +1004,7 @@ static void logic_task(void *arg)
             }
 
             if (evt.btn_idx < MAIN_BTN_COUNT) {
+                // Button 3 exits the menu when the menu is open.
                 if (s_in_menu) {
                     if (evt.type == EVT_BTN_PRESSED && evt.btn_idx == 3) {
                         s_in_menu = false;
@@ -926,6 +1015,7 @@ static void logic_task(void *arg)
                     bool *state = &s_btn_states[s_current_bank][evt.btn_idx];
 
                     if (evt.type == EVT_BTN_PRESSED) {
+                        // Each button type uses a different physical behavior.
                         if (cfg->type == BTN_TYPE_TOGGLE) {
                             *state = !(*state);
                             publish_mqtt_state(s_current_bank, evt.btn_idx, *state);
@@ -963,6 +1053,9 @@ static void logic_task(void *arg)
     }
 }
 
+/* Poll the physical inputs, debounce them, and convert changes into events.   */
+/* Keeping this task minimal makes the rest of the firmware easier to reason  */
+/* about and keeps the UI logic single-threaded.                               */
 static void hardware_task(void *arg)
 {
     uint16_t touch_values[BUTTON_COUNT] = {0};
@@ -977,6 +1070,8 @@ static void hardware_task(void *arg)
                 bool was_pressed = ((s_button_last_state >> k_button_pcf_bits[i]) & 0x01) == 0;
 
                 if (is_pressed != was_pressed) {
+                    // Time-based debounce: only accept the edge if it has stayed
+                    // stable long enough to likely be a real press or release.
                     if ((now_ms() - s_button_last_change_ms[i]) > 25) { 
                         input_event_t evt = {
                             .type = is_pressed ? EVT_BTN_PRESSED : EVT_BTN_RELEASED,
@@ -1008,7 +1103,12 @@ static void hardware_task(void *arg)
 
 /* --- Web Server Implementation --- */
 
-// The HTML Template
+/* -------------------------------------------------------------------------- */
+/* Web configuration UI                                                        */
+/*                                                                            */
+/* This page is intentionally small. It provides a way to change MQTT access  */
+/* without needing a serial terminal or a separate provisioning app.         */
+/* -------------------------------------------------------------------------- */
 static const char* html_template = 
     "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width, initial-scale=1'>"
     "<style>body{font-family:Arial;max-width:400px;margin:20px auto;padding:20px;background:#f4f4f4;}"
@@ -1021,7 +1121,7 @@ static const char* html_template =
     "<label>MQTT Password:</label><input type='password' name='mqtt_pass' value='%s'>"
     "<button type='submit'>Save & Reboot</button></form></body></html>";
 
-// GET Handler - Serves the HTML page
+/* Serve the configuration page with the current saved values filled in.      */
 static esp_err_t config_get_handler(httpd_req_t *req)
 {
     char response_html[1024];
@@ -1034,7 +1134,8 @@ static esp_err_t config_get_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
-// POST Handler - Parses the form submission
+/* Save the submitted form, persist it, and reboot so the network stack can   */
+/* come back with the new settings cleanly.                                   */
 static esp_err_t config_post_handler(httpd_req_t *req)
 {
     char buf[256];
@@ -1074,7 +1175,7 @@ static esp_err_t config_post_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
-// Start the HTTP server
+/* Start the tiny config server on port 80.                                  */
 static httpd_handle_t start_webserver(void)
 {
     httpd_handle_t server = NULL;
@@ -1095,7 +1196,13 @@ static httpd_handle_t start_webserver(void)
 }
 
 
-/* --- Main Entry Point --- */
+/* -------------------------------------------------------------------------- */
+/* Main entry point                                                            */
+/*                                                                            */
+/* Boot order matters: load settings, create the event queue, initialize      */
+/* hardware, start the startup animation, bring up networking, then launch   */
+/* the long-lived tasks.                                                      */
+/* -------------------------------------------------------------------------- */
 void app_main(void)
 {
     // 1. Initialize NVS (Required for Wi-Fi and later web settings)
@@ -1107,7 +1214,7 @@ void app_main(void)
     ESP_ERROR_CHECK(ret);
 
     load_default_config();
-    load_settings_nvs(); // Overwrite defaults with saved NVS values
+    load_settings_nvs(); // Saved settings override the baked-in defaults.
 
     s_btn_event_queue = xQueueCreate(20, sizeof(input_event_t));
 
@@ -1115,7 +1222,8 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
     // 2. Initialize Hardware
-    // (Ensure the names match the functions you pasted in Step 1)
+    // Bring up peripherals before networking so the splash screen can appear
+    // immediately while the transport stack is still starting.
     i2c_init();       
     lcd_init();
     buttons_init();
@@ -1123,6 +1231,7 @@ void app_main(void)
     ws2812_init();
 
     s_startup_complete = false;
+    // The startup task keeps animating in the background until boot completes.
     xTaskCreate(startup_task, "startup_ui", 3072, NULL, 6, NULL);
     
     // 3. Initialize Network Failover
