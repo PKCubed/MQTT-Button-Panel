@@ -277,6 +277,121 @@ static void build_mqtt_topic(char *dst, size_t dst_size, const char *base_topic,
     snprintf(dst, dst_size, "%.*s/%s", (int)base_len, base_topic, suffix);
 }
 
+static void sanitize_discovery_id(char *dst, size_t dst_size, const char *src, const char *fallback)
+{
+    if (dst_size == 0) {
+        return;
+    }
+
+    dst[0] = '\0';
+    size_t out = 0;
+
+    if (src != NULL) {
+        for (size_t i = 0; src[i] != '\0' && out < dst_size - 1; ++i) {
+            unsigned char ch = (unsigned char)src[i];
+            if (isalnum(ch)) {
+                dst[out++] = (char)tolower(ch);
+            } else if (ch == '/' || ch == '-' || ch == ' ' || ch == '.') {
+                dst[out++] = '_';
+            } else if (ch == '_') {
+                dst[out++] = '_';
+            }
+        }
+    }
+
+    if (out == 0 && fallback != NULL) {
+        for (size_t i = 0; fallback[i] != '\0' && out < dst_size - 1; ++i) {
+            unsigned char ch = (unsigned char)fallback[i];
+            if (isalnum(ch)) {
+                dst[out++] = (char)tolower(ch);
+            } else if (ch == '/' || ch == '-' || ch == ' ' || ch == '.') {
+                dst[out++] = '_';
+            }
+        }
+    }
+
+    dst[out] = '\0';
+}
+
+static void publish_button_discovery(uint8_t bank, uint8_t btn)
+{
+    if (!s_mqtt_client || !s_mqtt_connected) {
+        return;
+    }
+
+    char legacy_device_id[48];
+    sanitize_discovery_id(legacy_device_id, sizeof(legacy_device_id), s_config.panel_name, "mqtt_button_panel");
+    if (legacy_device_id[0] == '\0') {
+        snprintf(legacy_device_id, sizeof(legacy_device_id), "%s", "mqtt_button_panel");
+    }
+
+    char legacy_object_id[96];
+    char legacy_discovery_topic[256];
+    snprintf(legacy_object_id, sizeof(legacy_object_id), "%s_bank_%02u_button_%02u", legacy_device_id, (unsigned)(bank + 1), (unsigned)(btn + 1));
+    snprintf(legacy_discovery_topic, sizeof(legacy_discovery_topic), "homeassistant/switch/%s/%s/config", legacy_device_id, legacy_object_id);
+
+    esp_mqtt_client_publish(s_mqtt_client, legacy_discovery_topic, "", 0, 1, 1);
+
+    char topic_id[96];
+    char unique_id[192];
+    char discovery_topic[256];
+
+    const button_config_t *cfg = &s_config.banks[bank].buttons[btn];
+    if (bank >= s_config.num_banks || cfg->mqtt_topic[0] == '\0') {
+        return;
+    }
+
+    sanitize_discovery_id(topic_id, sizeof(topic_id), cfg->mqtt_topic, "button");
+    if (topic_id[0] == '\0') {
+        return;
+    }
+
+    snprintf(unique_id, sizeof(unique_id), "%s", topic_id);
+    snprintf(discovery_topic, sizeof(discovery_topic), "homeassistant/switch/%s/config", topic_id);
+
+    char state_topic[96];
+    char command_topic[96];
+    build_mqtt_topic(state_topic, sizeof(state_topic), cfg->mqtt_topic, "state");
+    build_mqtt_topic(command_topic, sizeof(command_topic), cfg->mqtt_topic, "command");
+
+    cJSON *root = cJSON_CreateObject();
+    if (!root) {
+        return;
+    }
+
+    cJSON_AddStringToObject(root, "name", cfg->display_name[0] ? cfg->display_name : topic_id);
+    cJSON_AddStringToObject(root, "unique_id", unique_id);
+    cJSON_AddStringToObject(root, "object_id", topic_id);
+    cJSON_AddStringToObject(root, "command_topic", command_topic);
+    cJSON_AddStringToObject(root, "state_topic", state_topic);
+    cJSON_AddStringToObject(root, "payload_on", "ON");
+    cJSON_AddStringToObject(root, "payload_off", "OFF");
+    cJSON_AddStringToObject(root, "payload_press", "ON");
+    cJSON_AddStringToObject(root, "payload_release", "OFF");
+
+    char *payload = cJSON_PrintUnformatted(root);
+    if (payload != NULL) {
+        esp_mqtt_client_publish(s_mqtt_client, discovery_topic, payload, 0, 1, 1);
+        ESP_LOGI(TAG, "MQTT DISCOVERY: %s", discovery_topic);
+        cJSON_free(payload);
+    }
+
+    cJSON_Delete(root);
+}
+
+static void publish_mqtt_discovery(void)
+{
+    if (!s_mqtt_client || !s_mqtt_connected) {
+        return;
+    }
+
+    for (uint8_t b = 0; b < MAX_BANKS; ++b) {
+        for (uint8_t i = 0; i < MAIN_BTN_COUNT; ++i) {
+            publish_button_discovery(b, i);
+        }
+    }
+}
+
 static esp_err_t i2c_write_u8(uint8_t addr, uint8_t value)
 {
     if (s_i2c_mutex == NULL) {
@@ -671,6 +786,8 @@ static bool touch_is_active(size_t idx, uint16_t current)
 }
 
 
+static void publish_mqtt_command(uint8_t bank, uint8_t btn, bool state);
+
 /* MQTT events update the connection flag, subscriptions, and mirrored button  */
 /* state. The handler is intentionally thin so the logic task still owns UI    */
 /* decisions.                                                                 */
@@ -681,7 +798,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         ESP_LOGI(TAG, "MQTT Connected to Broker!");
         s_mqtt_connected = true;
 
-        // Subscribe to all button state topics
+        // Subscribe only to HA state topics; HA remains the source of truth.
         for (int b = 0; b < s_config.num_banks; b++) {
             for (int i = 0; i < MAIN_BTN_COUNT; i++) {
                 char sub_topic[80];
@@ -690,7 +807,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                 ESP_LOGI(TAG, "Subscribed to: %s", sub_topic);
             }
         }
-        // We will add subscription logic here later for 2-way sync
+        publish_mqtt_discovery();
         request_ui_refresh();
     } else if (event->event_id == MQTT_EVENT_DISCONNECTED) {
         ESP_LOGW(TAG, "MQTT Disconnected from Broker");
@@ -717,10 +834,10 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             for (int i = 0; i < MAIN_BTN_COUNT; i++) {
                 char expected_topic[80];
                 build_mqtt_topic(expected_topic, sizeof(expected_topic), s_config.banks[b].buttons[i].mqtt_topic, "state");
-                
+
                 if (strcmp(topic, expected_topic) == 0) {
                     s_btn_states[b][i] = new_state;
-                    
+
                     // Only force a UI update if the changed button is on the currently visible bank
                     if (b == s_current_bank) {
                         input_event_t sync_evt = { 
@@ -767,12 +884,12 @@ static void start_mqtt(void) {
     esp_mqtt_client_start(s_mqtt_client);
 }
 
-/* Publish the logical button state, but only when MQTT is actually up.       */
-static void publish_mqtt_state(uint8_t bank, uint8_t btn, bool state) {
+/* Publish intent to Home Assistant; HA remains the source of truth.         */
+static void publish_mqtt_command(uint8_t bank, uint8_t btn, bool state) {
     if (!s_mqtt_client || !s_mqtt_connected) return; // Fail gracefully if not connected
     
     char pub_topic[80];
-    build_mqtt_topic(pub_topic, sizeof(pub_topic), s_config.banks[bank].buttons[btn].mqtt_topic, "set");
+    build_mqtt_topic(pub_topic, sizeof(pub_topic), s_config.banks[bank].buttons[btn].mqtt_topic, "command");
     const char *payload = state ? "ON" : "OFF";
     
     // Publish with QoS 1
@@ -1219,38 +1336,27 @@ static void logic_task(void *arg)
                     bool *state = &s_btn_states[s_current_bank][evt.btn_idx];
 
                     if (evt.type == EVT_BTN_PRESSED) {
-                        // Do NOT mutate local button state here. The panel's
-                        // visual state is authoritative from the broker via
-                        // the '<topic>/state' subscription. On press we only
-                        // publish to '<topic>/set' and let the state message
-                        // drive the color change when it arrives.
+                        // HA is the source of truth; button presses only emit intent.
                         if (cfg->type == BTN_TYPE_TOGGLE) {
-                            // For toggle, publish the desired toggle command.
-                            // We don't know the broker's current state here,
-                            // so we publish the inverse of our cached state
-                            // to request a flip; the broker will respond on
-                            // the /state topic and update us.
-                            publish_mqtt_state(s_current_bank, evt.btn_idx, !(*state));
+                            // For toggle, publish the desired intent based on the mirrored state.
+                            publish_mqtt_command(s_current_bank, evt.btn_idx, !(*state));
                         } else if (cfg->type == BTN_TYPE_MOMENTARY) {
-                            // Momentary: send ON on press; broker should emit
-                            // a state later and we'll update when /state arrives.
-                            publish_mqtt_state(s_current_bank, evt.btn_idx, true);
+                            // Momentary: send ON on press.
+                            publish_mqtt_command(s_current_bank, evt.btn_idx, true);
                         } else if (cfg->type == BTN_TYPE_RADIO) {
-                            // Radio: request all peers in the group be turned
-                            // off, then request this button be turned on. We
-                            // publish the off commands (so remote actors change)
-                            // but DO NOT modify local cached state here.
+                            // Radio: request all peers in the group be turned off,
+                            // then request this button be turned on.
                             for (int i = 0; i < MAIN_BTN_COUNT; i++) {
                                 if (s_config.banks[s_current_bank].buttons[i].radio_group == cfg->radio_group) {
-                                    publish_mqtt_state(s_current_bank, i, false);
+                                    publish_mqtt_command(s_current_bank, i, false);
                                 }
                             }
-                            publish_mqtt_state(s_current_bank, evt.btn_idx, true);
+                            publish_mqtt_command(s_current_bank, evt.btn_idx, true);
                         }
                     } else if (evt.type == EVT_BTN_RELEASED) {
                         if (cfg->type == BTN_TYPE_MOMENTARY) {
                             // Send OFF on release for momentary buttons.
-                            publish_mqtt_state(s_current_bank, evt.btn_idx, false);
+                            publish_mqtt_command(s_current_bank, evt.btn_idx, false);
                         }
                     }
                     update_system_ui(current_touch_preview);
@@ -1635,6 +1741,10 @@ static esp_err_t api_post_config_handler(httpd_req_t *req)
         if (mqtt_changed || wifi_changed) {
             start_mqtt();
         }
+    }
+
+    if (s_mqtt_connected) {
+        publish_mqtt_discovery();
     }
 
     request_ui_refresh();
