@@ -19,6 +19,8 @@
 
 #include "esp_http_server.h"
 #include "nvs.h"
+#include "cJSON.h"
+#include "web_assets.h"
 
 #include "mqtt_client.h"
 static esp_mqtt_client_handle_t s_mqtt_client = NULL;
@@ -1175,19 +1177,257 @@ static esp_err_t config_post_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* Forward declarations for functions defined later in this file. */
+static void save_full_config_nvs(void);
+static void load_full_config_nvs(void);
+
+
+/* JSON API: GET /api/config - returns the current system and mqtt config */
+static esp_err_t api_get_config_handler(httpd_req_t *req)
+{
+    cJSON *root = cJSON_CreateObject();
+    if (!root) return ESP_FAIL;
+
+    cJSON_AddStringToObject(root, "panel_name", s_config.panel_name);
+    cJSON_AddNumberToObject(root, "num_banks", s_config.num_banks);
+
+    cJSON *mqtt = cJSON_CreateObject();
+    cJSON_AddStringToObject(mqtt, "broker_ip", s_mqtt_config.broker_ip);
+    cJSON_AddStringToObject(mqtt, "port", s_mqtt_config.port);
+    cJSON_AddStringToObject(mqtt, "username", s_mqtt_config.username);
+    cJSON_AddStringToObject(mqtt, "password", s_mqtt_config.password);
+    cJSON_AddItemToObject(root, "mqtt", mqtt);
+
+    cJSON *banks = cJSON_CreateArray();
+    for (int b = 0; b < s_config.num_banks && b < MAX_BANKS; ++b) {
+        cJSON *bank = cJSON_CreateObject();
+        cJSON_AddStringToObject(bank, "bank_name", s_config.banks[b].bank_name);
+
+        cJSON *buttons = cJSON_CreateArray();
+        for (int i = 0; i < MAIN_BTN_COUNT; ++i) {
+            cJSON *btn = cJSON_CreateObject();
+            cJSON_AddStringToObject(btn, "display_name", s_config.banks[b].buttons[i].display_name);
+            cJSON_AddStringToObject(btn, "mqtt_topic", s_config.banks[b].buttons[i].mqtt_topic);
+            cJSON_AddNumberToObject(btn, "type", s_config.banks[b].buttons[i].type);
+            cJSON_AddNumberToObject(btn, "radio_group", s_config.banks[b].buttons[i].radio_group);
+
+            cJSON *on = cJSON_CreateIntArray((const int*)s_config.banks[b].buttons[i].color_on, 3);
+            cJSON *off = cJSON_CreateIntArray((const int*)s_config.banks[b].buttons[i].color_off, 3);
+            cJSON_AddItemToObject(btn, "color_on", on);
+            cJSON_AddItemToObject(btn, "color_off", off);
+
+            cJSON_AddItemToArray(buttons, btn);
+        }
+        cJSON_AddItemToObject(bank, "buttons", buttons);
+        cJSON_AddItemToArray(banks, bank);
+    }
+    cJSON_AddItemToObject(root, "banks", banks);
+
+    char *out = cJSON_PrintUnformatted(root);
+    if (out) {
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, out, HTTPD_RESP_USE_STRLEN);
+        cJSON_free(out);
+    } else {
+        cJSON_Delete(root);
+        return ESP_FAIL;
+    }
+
+    cJSON_Delete(root);
+    return ESP_OK;
+}
+
+/* JSON API: POST /api/config - accept JSON to update config (partial allowed) */
+static esp_err_t api_post_config_handler(httpd_req_t *req)
+{
+    int content_len = req->content_len;
+    if (content_len <= 0 || content_len > 8192) return ESP_FAIL;
+
+    char *buf = malloc(content_len + 1);
+    if (!buf) return ESP_FAIL;
+    int ret = httpd_req_recv(req, buf, content_len);
+    if (ret <= 0) {
+        free(buf);
+        return ESP_FAIL;
+    }
+    buf[ret] = '\0';
+
+    cJSON *root = cJSON_Parse(buf);
+    free(buf);
+    if (!root) return ESP_FAIL;
+
+    cJSON *pn = cJSON_GetObjectItemCaseSensitive(root, "panel_name");
+    if (cJSON_IsString(pn) && (pn->valuestring != NULL)) {
+        snprintf(s_config.panel_name, sizeof(s_config.panel_name), "%s", pn->valuestring);
+    }
+
+    cJSON *nb = cJSON_GetObjectItemCaseSensitive(root, "num_banks");
+    if (cJSON_IsNumber(nb)) {
+        int v = nb->valueint;
+        if (v >= 1 && v <= MAX_BANKS) s_config.num_banks = v;
+    }
+
+    cJSON *mqtt = cJSON_GetObjectItemCaseSensitive(root, "mqtt");
+    if (cJSON_IsObject(mqtt)) {
+        cJSON *bip = cJSON_GetObjectItemCaseSensitive(mqtt, "broker_ip");
+        cJSON *port = cJSON_GetObjectItemCaseSensitive(mqtt, "port");
+        cJSON *user = cJSON_GetObjectItemCaseSensitive(mqtt, "username");
+        cJSON *pass = cJSON_GetObjectItemCaseSensitive(mqtt, "password");
+        if (cJSON_IsString(bip) && bip->valuestring) snprintf(s_mqtt_config.broker_ip, sizeof(s_mqtt_config.broker_ip), "%s", bip->valuestring);
+        if (cJSON_IsString(port) && port->valuestring) snprintf(s_mqtt_config.port, sizeof(s_mqtt_config.port), "%s", port->valuestring);
+        if (cJSON_IsString(user) && user->valuestring) snprintf(s_mqtt_config.username, sizeof(s_mqtt_config.username), "%s", user->valuestring);
+        if (cJSON_IsString(pass) && pass->valuestring) snprintf(s_mqtt_config.password, sizeof(s_mqtt_config.password), "%s", pass->valuestring);
+    }
+
+    /* Optional: parse banks/buttons if provided */
+    cJSON *banks = cJSON_GetObjectItemCaseSensitive(root, "banks");
+    if (cJSON_IsArray(banks)) {
+        int bidx = 0;
+        cJSON *bank;
+        cJSON_ArrayForEach(bank, banks) {
+            if (bidx >= MAX_BANKS) break;
+            cJSON *bname = cJSON_GetObjectItemCaseSensitive(bank, "bank_name");
+            if (cJSON_IsString(bname) && bname->valuestring) snprintf(s_config.banks[bidx].bank_name, sizeof(s_config.banks[bidx].bank_name), "%s", bname->valuestring);
+
+            cJSON *buttons = cJSON_GetObjectItemCaseSensitive(bank, "buttons");
+            if (cJSON_IsArray(buttons)) {
+                int bi = 0;
+                cJSON *bitem;
+                cJSON_ArrayForEach(bitem, buttons) {
+                    if (bi >= MAIN_BTN_COUNT) break;
+                    cJSON *d = cJSON_GetObjectItemCaseSensitive(bitem, "display_name");
+                    cJSON *mt = cJSON_GetObjectItemCaseSensitive(bitem, "mqtt_topic");
+                    cJSON *tp = cJSON_GetObjectItemCaseSensitive(bitem, "type");
+                    cJSON *rg = cJSON_GetObjectItemCaseSensitive(bitem, "radio_group");
+                    if (cJSON_IsString(d) && d->valuestring) snprintf(s_config.banks[bidx].buttons[bi].display_name, sizeof(s_config.banks[bidx].buttons[bi].display_name), "%s", d->valuestring);
+                    if (cJSON_IsString(mt) && mt->valuestring) snprintf(s_config.banks[bidx].buttons[bi].mqtt_topic, sizeof(s_config.banks[bidx].buttons[bi].mqtt_topic), "%s", mt->valuestring);
+                    if (cJSON_IsNumber(tp)) s_config.banks[bidx].buttons[bi].type = (btn_type_t)tp->valueint;
+                    if (cJSON_IsNumber(rg)) s_config.banks[bidx].buttons[bi].radio_group = (uint8_t)rg->valueint;
+
+                    /* colors */
+                    cJSON *co = cJSON_GetObjectItemCaseSensitive(bitem, "color_on");
+                    cJSON *cf = cJSON_GetObjectItemCaseSensitive(bitem, "color_off");
+                    if (cJSON_IsArray(co) && cJSON_GetArraySize(co) >= 3) {
+                        for (int k=0;k<3;k++) {
+                            cJSON *n = cJSON_GetArrayItem(co,k);
+                            if (cJSON_IsNumber(n)) s_config.banks[bidx].buttons[bi].color_on[k] = (uint8_t)n->valueint;
+                        }
+                    }
+                    if (cJSON_IsArray(cf) && cJSON_GetArraySize(cf) >= 3) {
+                        for (int k=0;k<3;k++) {
+                            cJSON *n = cJSON_GetArrayItem(cf,k);
+                            if (cJSON_IsNumber(n)) s_config.banks[bidx].buttons[bi].color_off[k] = (uint8_t)n->valueint;
+                        }
+                    }
+
+                    bi++;
+                }
+            }
+            bidx++;
+        }
+    }
+
+    /* Persist and apply */
+    save_full_config_nvs();
+    start_mqtt();
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, "{\"result\":\"ok\"}", HTTPD_RESP_USE_STRLEN);
+
+    cJSON_Delete(root);
+    return ESP_OK;
+}
+
+/* JSON API: GET /api/diag - returns diagnostic info */
+static esp_err_t api_diag_handler(httpd_req_t *req)
+{
+    cJSON *root = cJSON_CreateObject();
+    if (!root) return ESP_FAIL;
+
+    cJSON_AddBoolToObject(root, "eth_connected", s_eth_connected);
+    cJSON_AddBoolToObject(root, "wifi_connected", s_wifi_connected);
+    cJSON_AddBoolToObject(root, "mqtt_connected", s_mqtt_connected);
+    cJSON_AddNumberToObject(root, "button_raw_state", s_button_state);
+
+    cJSON *tb = cJSON_CreateIntArray((const int*)s_touch_baseline, BUTTON_COUNT);
+    cJSON_AddItemToObject(root, "touch_baseline", tb);
+
+    char *out = cJSON_PrintUnformatted(root);
+    if (out) {
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, out, HTTPD_RESP_USE_STRLEN);
+        cJSON_free(out);
+    } else {
+        cJSON_Delete(root);
+        return ESP_FAIL;
+    }
+
+    cJSON_Delete(root);
+    return ESP_OK;
+}
+
+/* Serve embedded web assets helper (file-scope) */
+static esp_err_t serve_str(httpd_req_t *req, const char *data, const char *type)
+{
+    httpd_resp_set_type(req, type);
+    return httpd_resp_send(req, data, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t serve_dashboard_handler(httpd_req_t *req) { return serve_str(req, web_index_html, "text/html"); }
+static esp_err_t serve_config_page_handler(httpd_req_t *req) { return serve_str(req, web_config_html, "text/html"); }
+static esp_err_t serve_diag_page_handler(httpd_req_t *req) { return serve_str(req, web_diag_html, "text/html"); }
+static esp_err_t serve_css_handler(httpd_req_t *req) { return serve_str(req, web_styles_css, "text/css"); }
+static esp_err_t serve_js_handler(httpd_req_t *req) { return serve_str(req, web_app_js, "application/javascript"); }
+
 /* Start the tiny config server on port 80.                                  */
 static httpd_handle_t start_webserver(void)
 {
     httpd_handle_t server = NULL;
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 8; 
+    config.max_uri_handlers = 16;  /* Accommodate all endpoints: save, api config/diag, pages, static assets */ 
 
     if (httpd_start(&server, &config) == ESP_OK) {
-        httpd_uri_t uri_get = { .uri = "/", .method = HTTP_GET, .handler = config_get_handler, .user_ctx = NULL };
-        httpd_register_uri_handler(server, &uri_get);
+        /* Serve root and pages */
+        httpd_uri_t uri_root = { .uri = "/", .method = HTTP_GET, .handler = api_get_config_handler, .user_ctx = NULL };
+        /* We'll serve dashboard on /dashboard */
+        httpd_uri_t uri_dashboard = { .uri = "/dashboard", .method = HTTP_GET, .handler = NULL, .user_ctx = NULL };
+        /* Register simple file handlers below */
+        
+        /* Serve dashboard HTML */
+        httpd_uri_t uri_dash_html = { .uri = "/dashboard", .method = HTTP_GET, .handler = NULL, .user_ctx = NULL };
+        /* We'll register dedicated handlers for static files further down */
+        
+        /* Keep existing config GET handler as /config (UI page) */
+        httpd_uri_t uri_config_page = { .uri = "/config", .method = HTTP_GET, .handler = NULL, .user_ctx = NULL };
 
         httpd_uri_t uri_post = { .uri = "/save", .method = HTTP_POST, .handler = config_post_handler, .user_ctx = NULL };
         httpd_register_uri_handler(server, &uri_post);
+
+        /* Static asset handlers: inline serve from web_assets.h */
+        httpd_uri_t uri_static_css = { .uri = "/static/styles.css", .method = HTTP_GET, .handler = NULL, .user_ctx = NULL };
+        httpd_uri_t uri_static_js = { .uri = "/static/app.js", .method = HTTP_GET, .handler = NULL, .user_ctx = NULL };
+
+        /* We'll register the API and static handlers after this block using function pointers defined below. */
+        
+        /* Register JSON API endpoints */
+        /* Register JSON API endpoints */
+        httpd_register_uri_handler(server, &(httpd_uri_t){ .uri = "/api/config", .method = HTTP_GET, .handler = api_get_config_handler, .user_ctx = NULL });
+        httpd_register_uri_handler(server, &(httpd_uri_t){ .uri = "/api/config", .method = HTTP_POST, .handler = api_post_config_handler, .user_ctx = NULL });
+        httpd_register_uri_handler(server, &(httpd_uri_t){ .uri = "/api/diag", .method = HTTP_GET, .handler = api_diag_handler, .user_ctx = NULL });
+
+        /* Serve UI pages and static assets using small inline handlers that use embedded strings */
+        extern esp_err_t serve_dashboard_handler(httpd_req_t *req);
+        extern esp_err_t serve_config_page_handler(httpd_req_t *req);
+        extern esp_err_t serve_diag_page_handler(httpd_req_t *req);
+        extern esp_err_t serve_css_handler(httpd_req_t *req);
+        extern esp_err_t serve_js_handler(httpd_req_t *req);
+
+        httpd_register_uri_handler(server, &(httpd_uri_t){ .uri = "/", .method = HTTP_GET, .handler = serve_dashboard_handler, .user_ctx = NULL });
+        httpd_register_uri_handler(server, &(httpd_uri_t){ .uri = "/dashboard", .method = HTTP_GET, .handler = serve_dashboard_handler, .user_ctx = NULL });
+        httpd_register_uri_handler(server, &(httpd_uri_t){ .uri = "/config", .method = HTTP_GET, .handler = serve_config_page_handler, .user_ctx = NULL });
+        httpd_register_uri_handler(server, &(httpd_uri_t){ .uri = "/diag", .method = HTTP_GET, .handler = serve_diag_page_handler, .user_ctx = NULL });
+        httpd_register_uri_handler(server, &(httpd_uri_t){ .uri = "/static/styles.css", .method = HTTP_GET, .handler = serve_css_handler, .user_ctx = NULL });
+        httpd_register_uri_handler(server, &(httpd_uri_t){ .uri = "/static/app.js", .method = HTTP_GET, .handler = serve_js_handler, .user_ctx = NULL });
         
         ESP_LOGI(TAG, "Web server started on port %d", config.server_port);
         return server;
@@ -1215,6 +1455,7 @@ void app_main(void)
 
     load_default_config();
     load_settings_nvs(); // Saved settings override the baked-in defaults.
+    load_full_config_nvs(); // Load any saved full system config
 
     s_btn_event_queue = xQueueCreate(20, sizeof(input_event_t));
 
@@ -1250,4 +1491,36 @@ void app_main(void)
     update_system_ui(-1);
 
     ESP_LOGI(TAG, "System Boot Complete. Tasks running.");
+}
+
+/* Persist the entire system configuration (system + mqtt) as blobs in NVS. */
+static void save_full_config_nvs(void)
+{
+    nvs_handle_t my_handle;
+    if (nvs_open("storage", NVS_READWRITE, &my_handle) == ESP_OK) {
+        nvs_set_blob(my_handle, "sys_cfg", &s_config, sizeof(s_config));
+        nvs_set_blob(my_handle, "mqtt_cfg", &s_mqtt_config, sizeof(s_mqtt_config));
+        nvs_commit(my_handle);
+        nvs_close(my_handle);
+        ESP_LOGI(TAG, "Full config saved to NVS");
+    }
+}
+
+static void load_full_config_nvs(void)
+{
+    nvs_handle_t my_handle;
+    if (nvs_open("storage", NVS_READONLY, &my_handle) == ESP_OK) {
+        size_t required_size = 0;
+        if (nvs_get_blob(my_handle, "sys_cfg", NULL, &required_size) == ESP_OK && required_size == sizeof(s_config)) {
+            nvs_get_blob(my_handle, "sys_cfg", &s_config, &required_size);
+            ESP_LOGI(TAG, "Loaded system config from NVS");
+        }
+
+        required_size = 0;
+        if (nvs_get_blob(my_handle, "mqtt_cfg", NULL, &required_size) == ESP_OK && required_size == sizeof(s_mqtt_config)) {
+            nvs_get_blob(my_handle, "mqtt_cfg", &s_mqtt_config, &required_size);
+            ESP_LOGI(TAG, "Loaded mqtt config from NVS");
+        }
+        nvs_close(my_handle);
+    }
 }

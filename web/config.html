@@ -1,0 +1,45 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <link rel="stylesheet" href="/static/styles.css">
+  <title>Panel Configuration</title>
+</head>
+<body>
+  <nav>
+    <a href="/dashboard">Dashboard</a>
+    <a href="/config" class="active">Configure</a>
+    <a href="/diag">Diagnostics</a>
+  </nav>
+  <main>
+    <h1>Configuration</h1>
+    <div id="alert"></div>
+    <form id="config-form">
+      <div class="form-group">
+        <label>Panel Name</label>
+        <input name="panel_name" placeholder="e.g., Sanctuary Lights">
+      </div>
+      <h3>MQTT Settings</h3>
+      <div class="form-group">
+        <label>Broker IP Address</label>
+        <input name="mqtt.broker_ip" placeholder="192.168.1.100">
+      </div>
+      <div class="form-group">
+        <label>Broker Port</label>
+        <input name="mqtt.port" placeholder="1883">
+      </div>
+      <div class="form-group">
+        <label>Username (optional)</label>
+        <input name="mqtt.username" placeholder="user">
+      </div>
+      <div class="form-group">
+        <label>Password (optional)</label>
+        <input name="mqtt.password" type="password" placeholder="password">
+      </div>
+      <button type="submit">Save Configuration</button>
+    </form>
+  </main>
+  <script src="/static/app.js"></script>
+</body>
+</html>
