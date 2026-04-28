@@ -79,7 +79,7 @@ static const touch_pad_t k_touch_channels[BUTTON_COUNT] = {
 /* The runtime UI is driven by a small in-memory description of the panel:    */
 /* banks, buttons, MQTT topics, and LED colors.                               */
 /* -------------------------------------------------------------------------- */
-#define MAX_BANKS 4
+#define MAX_BANKS 8
 #define MAIN_BTN_COUNT 4
 #define BTN_BANK_DOWN 4
 #define BTN_BANK_UP 5
@@ -1466,6 +1466,7 @@ static esp_err_t serve_str(httpd_req_t *req, const char *data, const char *type)
 
 static esp_err_t serve_dashboard_handler(httpd_req_t *req) { return serve_str(req, web_index_html, "text/html"); }
 static esp_err_t serve_config_page_handler(httpd_req_t *req) { return serve_str(req, web_config_html, "text/html"); }
+static esp_err_t serve_banks_page_handler(httpd_req_t *req) { return serve_str(req, web_banks_html, "text/html"); }
 static esp_err_t serve_diag_page_handler(httpd_req_t *req) { return serve_str(req, web_diag_html, "text/html"); }
 static esp_err_t serve_css_handler(httpd_req_t *req) { return serve_str(req, web_styles_css, "text/css"); }
 static esp_err_t serve_js_handler(httpd_req_t *req) { return serve_str(req, web_app_js, "application/javascript"); }
@@ -1475,7 +1476,7 @@ static httpd_handle_t start_webserver(void)
 {
     httpd_handle_t server = NULL;
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 17;  /* Accommodate all endpoints: save, api config/diag/reboot, pages, static assets */ 
+    config.max_uri_handlers = 18;  /* Accommodate all endpoints: save, api config/diag/reboot, pages (including banks), static assets */
 
     if (httpd_start(&server, &config) == ESP_OK) {
         /* Serve root and pages */
@@ -1510,6 +1511,7 @@ static httpd_handle_t start_webserver(void)
         /* Serve UI pages and static assets using small inline handlers that use embedded strings */
         extern esp_err_t serve_dashboard_handler(httpd_req_t *req);
         extern esp_err_t serve_config_page_handler(httpd_req_t *req);
+        extern esp_err_t serve_banks_page_handler(httpd_req_t *req);
         extern esp_err_t serve_diag_page_handler(httpd_req_t *req);
         extern esp_err_t serve_css_handler(httpd_req_t *req);
         extern esp_err_t serve_js_handler(httpd_req_t *req);
@@ -1517,6 +1519,7 @@ static httpd_handle_t start_webserver(void)
         httpd_register_uri_handler(server, &(httpd_uri_t){ .uri = "/", .method = HTTP_GET, .handler = serve_dashboard_handler, .user_ctx = NULL });
         httpd_register_uri_handler(server, &(httpd_uri_t){ .uri = "/dashboard", .method = HTTP_GET, .handler = serve_dashboard_handler, .user_ctx = NULL });
         httpd_register_uri_handler(server, &(httpd_uri_t){ .uri = "/config", .method = HTTP_GET, .handler = serve_config_page_handler, .user_ctx = NULL });
+        httpd_register_uri_handler(server, &(httpd_uri_t){ .uri = "/banks", .method = HTTP_GET, .handler = serve_banks_page_handler, .user_ctx = NULL });
         httpd_register_uri_handler(server, &(httpd_uri_t){ .uri = "/diag", .method = HTTP_GET, .handler = serve_diag_page_handler, .user_ctx = NULL });
         httpd_register_uri_handler(server, &(httpd_uri_t){ .uri = "/static/styles.css", .method = HTTP_GET, .handler = serve_css_handler, .user_ctx = NULL });
         httpd_register_uri_handler(server, &(httpd_uri_t){ .uri = "/static/app.js", .method = HTTP_GET, .handler = serve_js_handler, .user_ctx = NULL });

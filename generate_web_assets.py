@@ -45,6 +45,7 @@ def main():
     try:
         index_html = read_file(os.path.join(web_dir, 'index.html'))
         config_html = read_file(os.path.join(web_dir, 'config.html'))
+        banks_html = read_file(os.path.join(web_dir, 'banks.html'))
         diag_html = read_file(os.path.join(web_dir, 'diag.html'))
         styles_css = read_file(os.path.join(web_dir, 'styles.css'))
         app_js = read_file(os.path.join(web_dir, 'app.js'))
@@ -56,6 +57,7 @@ def main():
     c_code = '#pragma once\n\n'
     c_code += generate_c_array('web_index_html', index_html)
     c_code += generate_c_array('web_config_html', config_html)
+    c_code += generate_c_array('web_banks_html', banks_html)
     c_code += generate_c_array('web_diag_html', diag_html)
     c_code += generate_c_array('web_styles_css', styles_css)
     c_code += generate_c_array('web_app_js', app_js)
@@ -67,6 +69,7 @@ def main():
     print(f"✓ Generated {output_file}")
     print(f"  - web_index_html ({len(index_html)} bytes)")
     print(f"  - web_config_html ({len(config_html)} bytes)")
+    print(f"  - web_banks_html ({len(banks_html)} bytes)")
     print(f"  - web_diag_html ({len(diag_html)} bytes)")
     print(f"  - web_styles_css ({len(styles_css)} bytes)")
     print(f"  - web_app_js ({len(app_js)} bytes)")

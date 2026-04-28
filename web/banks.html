@@ -1,0 +1,278 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <link rel="stylesheet" href="/static/styles.css">
+  <title>Banks & Buttons</title>
+</head>
+<body>
+  <nav>
+    <a href="/dashboard">Dashboard</a>
+    <a href="/config">Configure</a>
+    <a href="/banks" class="active">Banks & Buttons</a>
+    <a href="/diag">Diagnostics</a>
+  </nav>
+  <main>
+    <h1>Banks & Buttons Configuration</h1>
+    <div id="alert"></div>
+    
+    <div class="config-section">
+      <h3>Panel Name</h3>
+      <div class="form-group">
+        <input id="panel-name-input" type="text" placeholder="Panel name" maxlength="16">
+        <button type="button" id="save-panel-name-btn" class="btn-small">Save</button>
+      </div>
+    </div>
+
+    <div class="config-section">
+      <h3>Number of Banks</h3>
+      <div style="display:flex;gap:12px;align-items:center;">
+        <input id="num-banks-input" type="number" min="1" max="8" style="width:80px;">
+        <button type="button" id="update-banks-btn" class="btn-small">Update</button>
+        <span id="bank-count-info" style="color:#666;font-size:14px;"></span>
+      </div>
+    </div>
+
+    <div id="banks-container" style="margin-top:24px;">
+      <!-- Banks will be populated here -->
+    </div>
+
+    <div style="margin-top:24px;text-align:center;">
+      <button id="save-all-btn" type="button" style="padding:12px 24px;font-size:16px;">Save All Changes</button>
+    </div>
+  </main>
+  <script src="/static/app.js"></script>
+  <script>
+    async function initBanks() {
+      try {
+        const cfg = await fetchJson('/api/config');
+        renderBanksUI(cfg);
+        
+        document.getElementById('panel-name-input').value = cfg.panel_name || '';
+        document.getElementById('num-banks-input').value = cfg.num_banks;
+        
+        document.getElementById('save-panel-name-btn').addEventListener('click', async () => {
+          const newName = document.getElementById('panel-name-input').value;
+          cfg.panel_name = newName;
+          await saveConfig(cfg);
+        });
+        
+        document.getElementById('update-banks-btn').addEventListener('click', async () => {
+          const newNum = parseInt(document.getElementById('num-banks-input').value) || 1;
+          if (newNum < 1 || newNum > 8) {
+            showAlert('Number of banks must be between 1 and 8', 'error');
+            return;
+          }
+          if (newNum < cfg.num_banks) {
+            if (!confirm(`Reducing banks from ${cfg.num_banks} to ${newNum}. Banks ${newNum + 1}-${cfg.num_banks} will be lost. Continue?`)) {
+              document.getElementById('num-banks-input').value = cfg.num_banks;
+              return;
+            }
+            cfg.banks.splice(newNum); // truncate
+          } else if (newNum > cfg.num_banks) {
+            // initialize new banks with defaults
+            for (let nb = cfg.num_banks; nb < newNum; nb++) {
+              cfg.banks[nb] = createDefaultBank(nb+1);
+            }
+          }
+          cfg.num_banks = newNum;
+          renderBanksUI(cfg);
+        });
+        
+        document.getElementById('save-all-btn').addEventListener('click', async () => {
+          await saveConfig(cfg);
+        });
+        
+      } catch (e) {
+        console.error(e);
+        showAlert('Failed to load configuration: ' + e.message, 'error');
+      }
+    }
+    
+    function renderBanksUI(cfg) {
+      const container = document.getElementById('banks-container');
+      container.innerHTML = '';
+      
+      for (let b = 0; b < cfg.num_banks; b++) {
+        const bank = cfg.banks[b];
+        const bankDiv = document.createElement('div');
+        bankDiv.className = 'bank-card';
+        bankDiv.innerHTML = `
+          <div class="bank-header">
+            <div>
+              <label>Bank ${b + 1} Name:</label>
+              <input type="text" class="bank-name" maxlength="16" value="${bank.bank_name || ''}">
+            </div>
+          </div>
+          <div class="buttons-grid">
+        `;
+        
+        for (let i = 0; i < cfg.banks[b].buttons.length; i++) {
+            const btn = cfg.banks[b].buttons[i];
+          bankDiv.innerHTML += `
+            <div class="button-card">
+              <div class="button-header">
+                  <input type="text" class="btn-name" placeholder="Button name" maxlength="16" value="${btn.display_name || ''}">
+                  <button class="btn-small copy-btn" title="Copy button">Copy</button>
+                  <button class="btn-small paste-btn" title="Paste button">Paste</button>
+              </div>
+              <div class="form-group">
+                <label>MQTT Topic</label>
+                <input type="text" class="btn-topic" placeholder="e.g., scene/zone/state" maxlength="63" value="${btn.mqtt_topic || ''}">
+              </div>
+              <div class="form-group">
+                <label>Button Type</label>
+                <select class="btn-type">
+                  <option value="0" ${btn.type === 0 ? 'selected' : ''}>Toggle</option>
+                  <option value="1" ${btn.type === 1 ? 'selected' : ''}>Momentary</option>
+                  <option value="2" ${btn.type === 2 ? 'selected' : ''}>Radio</option>
+                </select>
+              </div>
+              <div class="form-group ${btn.type === 2 ? '' : 'hidden'}">
+                <label>Radio Group</label>
+                <input type="number" class="btn-radio-group" min="0" max="255" value="${btn.radio_group || 0}">
+              </div>
+              <div class="color-section">
+                <label>LED Colors</label>
+                <div style="display:flex;gap:12px;">
+                  <div>
+                    <small>On</small>
+                    <input type="color" class="btn-color-on" value="#${toHex(btn.color_on || [0,0,0])}">
+                  </div>
+                  <div>
+                    <small>Off</small>
+                    <input type="color" class="btn-color-off" value="#${toHex(btn.color_off || [0,0,0])}">
+                  </div>
+                </div>
+              </div>
+            </div>
+          `;
+        }
+        
+        bankDiv.innerHTML += '</div>';
+        container.appendChild(bankDiv);
+      }
+      
+      // Wire up dynamic events
+      document.querySelectorAll('.btn-type').forEach((select, idx) => {
+        select.addEventListener('change', (e) => {
+          const radioGroupField = e.target.closest('.button-card').querySelector('.btn-radio-group').parentElement;
+          radioGroupField.classList.toggle('hidden', e.target.value !== '2');
+        });
+      });
+
+      // Copy/paste logic
+      let copyBuffer = null;
+      document.querySelectorAll('.copy-btn').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+          const card = e.target.closest('.button-card');
+          copyBuffer = collectButtonCard(card);
+          showAlert('Button copied to clipboard', 'success');
+        });
+      });
+      document.querySelectorAll('.paste-btn').forEach(btn => {
+        btn.addEventListener('click', async (e) => {
+          if (!copyBuffer) { showAlert('Nothing to paste', 'error'); return; }
+          const card = e.target.closest('.button-card');
+          applyButtonCard(card, copyBuffer);
+          showAlert('Pasted settings to button (save to persist)', 'success');
+        });
+      });
+    }
+    
+    async function saveConfig(cfg) {
+      // Collect all values from the UI
+      const panelNameInput = document.getElementById('panel-name-input');
+      cfg.panel_name = panelNameInput.value;
+      
+      document.querySelectorAll('.bank-card').forEach((bankDiv, b) => {
+        const bankNameInput = bankDiv.querySelector('.bank-name');
+        cfg.banks[b].bank_name = bankNameInput.value;
+        
+        bankDiv.querySelectorAll('.button-card').forEach((btnDiv, i) => {
+          cfg.banks[b].buttons[i].display_name = btnDiv.querySelector('.btn-name').value;
+          cfg.banks[b].buttons[i].mqtt_topic = btnDiv.querySelector('.btn-topic').value;
+          cfg.banks[b].buttons[i].type = parseInt(btnDiv.querySelector('.btn-type').value);
+          cfg.banks[b].buttons[i].radio_group = parseInt(btnDiv.querySelector('.btn-radio-group').value);
+          
+          const onColor = btnDiv.querySelector('.btn-color-on').value;
+          const offColor = btnDiv.querySelector('.btn-color-off').value;
+          cfg.banks[b].buttons[i].color_on = hexToRgb(onColor);
+          cfg.banks[b].buttons[i].color_off = hexToRgb(offColor);
+        });
+      });
+      
+      try {
+        const res = await fetch('/api/config', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(cfg)
+        });
+        if (res.ok) {
+          showAlert('✓ All configuration saved successfully', 'success');
+        } else {
+          showAlert('✗ Failed to save configuration', 'error');
+        }
+      } catch (e) {
+        showAlert('✗ Error: ' + e.message, 'error');
+      }
+    }
+    
+    function toHex(rgb) {
+      return rgb.map(x => (x || 0).toString(16).padStart(2, '0')).join('');
+    }
+    
+    function hexToRgb(hex) {
+      const result = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
+      return result ? [parseInt(result[1], 16), parseInt(result[2], 16), parseInt(result[3], 16)] : [0, 0, 0];
+    }
+
+    function createDefaultBank(index) {
+      const bank = { bank_name: `Bank ${index}`, buttons: [] };
+      for (let i = 0; i < 4; i++) {
+        bank.buttons.push({
+          display_name: `Btn ${i+1}`,
+          mqtt_topic: `panel/bank${index}/btn${i+1}`,
+          type: 0,
+          radio_group: 0,
+          color_on: [0,255,0],
+          color_off: [255,0,0]
+        });
+      }
+      return bank;
+    }
+
+    function collectButtonCard(card) {
+      return {
+        display_name: card.querySelector('.btn-name').value,
+        mqtt_topic: card.querySelector('.btn-topic').value,
+        type: parseInt(card.querySelector('.btn-type').value),
+        radio_group: parseInt(card.querySelector('.btn-radio-group')?.value || 0),
+        color_on: hexToRgb(card.querySelector('.btn-color-on').value),
+        color_off: hexToRgb(card.querySelector('.btn-color-off').value)
+      };
+    }
+
+    function applyButtonCard(card, data) {
+      card.querySelector('.btn-name').value = data.display_name || '';
+      card.querySelector('.btn-topic').value = data.mqtt_topic || '';
+      card.querySelector('.btn-type').value = String(data.type || 0);
+      const rg = card.querySelector('.btn-radio-group'); if (rg) rg.value = data.radio_group || 0;
+      card.querySelector('.btn-color-on').value = `#${toHex(data.color_on || [0,0,0])}`;
+      card.querySelector('.btn-color-off').value = `#${toHex(data.color_off || [0,0,0])}`;
+    }
+    
+    function showAlert(msg, type) {
+      const alertDiv = document.getElementById('alert');
+      const className = type === 'error' ? 'alert error' : 'alert success';
+      alertDiv.innerHTML = `<div class="${className}">${msg}</div>`;
+      if (type === 'success') {
+        setTimeout(() => alertDiv.innerHTML = '', 3000);
+      }
+    }
+    
+    if (location.pathname === '/banks') initBanks();
+  </script>
+</body>
+</html>
