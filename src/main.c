@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <string.h>
+#include <ctype.h>
 
 #include "driver/gpio.h"
 #include "driver/i2c.h"
@@ -208,6 +209,15 @@ static void sanitize_config(void)
             button_config_t *btn = &s_config.banks[b].buttons[i];
             btn->display_name[sizeof(btn->display_name) - 1] = '\0';
             btn->mqtt_topic[sizeof(btn->mqtt_topic) - 1] = '\0';
+            size_t topic_len = strnlen(btn->mqtt_topic, sizeof(btn->mqtt_topic));
+            while (topic_len > 0) {
+                unsigned char last = (unsigned char)btn->mqtt_topic[topic_len - 1];
+                if (last != '/' && !isspace(last)) {
+                    break;
+                }
+                btn->mqtt_topic[topic_len - 1] = '\0';
+                topic_len--;
+            }
             if (btn->type < BTN_TYPE_TOGGLE || btn->type > BTN_TYPE_RADIO) {
                 btn->type = BTN_TYPE_TOGGLE;
             }
@@ -237,6 +247,34 @@ static void request_ui_refresh(void)
 static int64_t now_ms(void)
 {
     return esp_timer_get_time() / 1000;
+}
+
+static void build_mqtt_topic(char *dst, size_t dst_size, const char *base_topic, const char *suffix)
+{
+    if (dst_size == 0) {
+        return;
+    }
+
+    dst[0] = '\0';
+
+    if (!base_topic || !suffix) {
+        return;
+    }
+
+    size_t base_len = strnlen(base_topic, dst_size - 1);
+    while (base_len > 0) {
+        unsigned char last = (unsigned char)base_topic[base_len - 1];
+        if (last != '/' && !isspace(last)) {
+            break;
+        }
+        base_len--;
+    }
+
+    if (base_len == 0) {
+        return;
+    }
+
+    snprintf(dst, dst_size, "%.*s/%s", (int)base_len, base_topic, suffix);
 }
 
 static esp_err_t i2c_write_u8(uint8_t addr, uint8_t value)
@@ -647,7 +685,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         for (int b = 0; b < s_config.num_banks; b++) {
             for (int i = 0; i < MAIN_BTN_COUNT; i++) {
                 char sub_topic[80];
-                snprintf(sub_topic, sizeof(sub_topic), "%s/state", s_config.banks[b].buttons[i].mqtt_topic);
+                build_mqtt_topic(sub_topic, sizeof(sub_topic), s_config.banks[b].buttons[i].mqtt_topic, "state");
                 esp_mqtt_client_subscribe(s_mqtt_client, sub_topic, 1);
                 ESP_LOGI(TAG, "Subscribed to: %s", sub_topic);
             }
@@ -678,7 +716,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         for (int b = 0; b < s_config.num_banks; b++) {
             for (int i = 0; i < MAIN_BTN_COUNT; i++) {
                 char expected_topic[80];
-                snprintf(expected_topic, sizeof(expected_topic), "%s/state", s_config.banks[b].buttons[i].mqtt_topic);
+                build_mqtt_topic(expected_topic, sizeof(expected_topic), s_config.banks[b].buttons[i].mqtt_topic, "state");
                 
                 if (strcmp(topic, expected_topic) == 0) {
                     s_btn_states[b][i] = new_state;
@@ -734,7 +772,7 @@ static void publish_mqtt_state(uint8_t bank, uint8_t btn, bool state) {
     if (!s_mqtt_client || !s_mqtt_connected) return; // Fail gracefully if not connected
     
     char pub_topic[80];
-    snprintf(pub_topic, sizeof(pub_topic), "%s/set", s_config.banks[bank].buttons[btn].mqtt_topic);
+    build_mqtt_topic(pub_topic, sizeof(pub_topic), s_config.banks[bank].buttons[btn].mqtt_topic, "set");
     const char *payload = state ? "ON" : "OFF";
     
     // Publish with QoS 1
