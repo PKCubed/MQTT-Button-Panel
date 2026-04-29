@@ -91,7 +91,7 @@ typedef enum { BTN_TYPE_TOGGLE, BTN_TYPE_MOMENTARY, BTN_TYPE_RADIO } btn_type_t;
 
 typedef struct {
     char display_name[17];
-    char mqtt_topic[64];
+    char entity_id[64];
     btn_type_t type;
     uint8_t color_on[3];  // RGB
     uint8_t color_off[3]; // RGB
@@ -208,14 +208,14 @@ static void sanitize_config(void)
         for (int i = 0; i < MAIN_BTN_COUNT; ++i) {
             button_config_t *btn = &s_config.banks[b].buttons[i];
             btn->display_name[sizeof(btn->display_name) - 1] = '\0';
-            btn->mqtt_topic[sizeof(btn->mqtt_topic) - 1] = '\0';
-            size_t topic_len = strnlen(btn->mqtt_topic, sizeof(btn->mqtt_topic));
+            btn->entity_id[sizeof(btn->entity_id) - 1] = '\0';
+            size_t topic_len = strnlen(btn->entity_id, sizeof(btn->entity_id));
             while (topic_len > 0) {
-                unsigned char last = (unsigned char)btn->mqtt_topic[topic_len - 1];
+                unsigned char last = (unsigned char)btn->entity_id[topic_len - 1];
                 if (last != '/' && !isspace(last)) {
                     break;
                 }
-                btn->mqtt_topic[topic_len - 1] = '\0';
+                btn->entity_id[topic_len - 1] = '\0';
                 topic_len--;
             }
             if (btn->type < BTN_TYPE_TOGGLE || btn->type > BTN_TYPE_RADIO) {
@@ -275,6 +275,30 @@ static void build_mqtt_topic(char *dst, size_t dst_size, const char *base_topic,
     }
 
     snprintf(dst, dst_size, "%.*s/%s", (int)base_len, base_topic, suffix);
+}
+
+static void build_panel_mqtt_topic(char *dst, size_t dst_size, const char *entity_id, const char *suffix)
+{
+    if (dst_size == 0) {
+        return;
+    }
+
+    dst[0] = '\0';
+
+    if (!entity_id || !suffix) {
+        return;
+    }
+
+    char base_topic[96];
+    if (strncmp(entity_id, "panels/", 7) == 0) {
+        snprintf(base_topic, sizeof(base_topic), "%s", entity_id);
+    } else if (strncmp(entity_id, "panels-", 7) == 0) {
+        snprintf(base_topic, sizeof(base_topic), "panels/%s", entity_id + 7);
+    } else {
+        snprintf(base_topic, sizeof(base_topic), "panels/%s", entity_id);
+    }
+
+    build_mqtt_topic(dst, dst_size, base_topic, suffix);
 }
 
 static void sanitize_discovery_id(char *dst, size_t dst_size, const char *src, const char *fallback)
@@ -337,11 +361,11 @@ static void publish_button_discovery(uint8_t bank, uint8_t btn)
     char discovery_topic[256];
 
     const button_config_t *cfg = &s_config.banks[bank].buttons[btn];
-    if (bank >= s_config.num_banks || cfg->mqtt_topic[0] == '\0') {
+    if (bank >= s_config.num_banks || cfg->entity_id[0] == '\0') {
         return;
     }
 
-    sanitize_discovery_id(topic_id, sizeof(topic_id), cfg->mqtt_topic, "button");
+    sanitize_discovery_id(topic_id, sizeof(topic_id), cfg->entity_id, "button");
     if (topic_id[0] == '\0') {
         return;
     }
@@ -351,8 +375,8 @@ static void publish_button_discovery(uint8_t bank, uint8_t btn)
 
     char state_topic[96];
     char command_topic[96];
-    build_mqtt_topic(state_topic, sizeof(state_topic), cfg->mqtt_topic, "state");
-    build_mqtt_topic(command_topic, sizeof(command_topic), cfg->mqtt_topic, "command");
+    build_panel_mqtt_topic(state_topic, sizeof(state_topic), cfg->entity_id, "state");
+    build_panel_mqtt_topic(command_topic, sizeof(command_topic), cfg->entity_id, "command");
 
     cJSON *root = cJSON_CreateObject();
     if (!root) {
@@ -379,6 +403,24 @@ static void publish_button_discovery(uint8_t bank, uint8_t btn)
     cJSON_Delete(root);
 }
 
+static void clear_button_discovery_by_entity_id(const char *entity_id)
+{
+    if (!s_mqtt_client || !s_mqtt_connected || entity_id == NULL || entity_id[0] == '\0') {
+        return;
+    }
+
+    char topic_id[96];
+    char discovery_topic[256];
+    sanitize_discovery_id(topic_id, sizeof(topic_id), entity_id, "button");
+    if (topic_id[0] == '\0') {
+        return;
+    }
+
+    snprintf(discovery_topic, sizeof(discovery_topic), "homeassistant/switch/%s/config", topic_id);
+    esp_mqtt_client_publish(s_mqtt_client, discovery_topic, "", 0, 1, 1);
+    ESP_LOGI(TAG, "MQTT DISCOVERY CLEAR: %s", discovery_topic);
+}
+
 static void publish_mqtt_discovery(void)
 {
     if (!s_mqtt_client || !s_mqtt_connected) {
@@ -388,6 +430,38 @@ static void publish_mqtt_discovery(void)
     for (uint8_t b = 0; b < MAX_BANKS; ++b) {
         for (uint8_t i = 0; i < MAIN_BTN_COUNT; ++i) {
             publish_button_discovery(b, i);
+        }
+    }
+}
+
+static void subscribe_all_state_topics(const system_config_t *cfg)
+{
+    if (!s_mqtt_client || cfg == NULL) {
+        return;
+    }
+
+    for (int b = 0; b < cfg->num_banks; b++) {
+        for (int i = 0; i < MAIN_BTN_COUNT; i++) {
+            char sub_topic[80];
+            build_panel_mqtt_topic(sub_topic, sizeof(sub_topic), cfg->banks[b].buttons[i].entity_id, "state");
+            esp_mqtt_client_subscribe(s_mqtt_client, sub_topic, 1);
+            ESP_LOGI(TAG, "Subscribed to: %s", sub_topic);
+        }
+    }
+}
+
+static void unsubscribe_all_state_topics(const system_config_t *cfg)
+{
+    if (!s_mqtt_client || cfg == NULL) {
+        return;
+    }
+
+    for (int b = 0; b < cfg->num_banks; b++) {
+        for (int i = 0; i < MAIN_BTN_COUNT; i++) {
+            char sub_topic[80];
+            build_panel_mqtt_topic(sub_topic, sizeof(sub_topic), cfg->banks[b].buttons[i].entity_id, "state");
+            esp_mqtt_client_unsubscribe(s_mqtt_client, sub_topic);
+            ESP_LOGI(TAG, "Unsubscribed from: %s", sub_topic);
         }
     }
 }
@@ -799,14 +873,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         s_mqtt_connected = true;
 
         // Subscribe only to HA state topics; HA remains the source of truth.
-        for (int b = 0; b < s_config.num_banks; b++) {
-            for (int i = 0; i < MAIN_BTN_COUNT; i++) {
-                char sub_topic[80];
-                build_mqtt_topic(sub_topic, sizeof(sub_topic), s_config.banks[b].buttons[i].mqtt_topic, "state");
-                esp_mqtt_client_subscribe(s_mqtt_client, sub_topic, 1);
-                ESP_LOGI(TAG, "Subscribed to: %s", sub_topic);
-            }
-        }
+        subscribe_all_state_topics(&s_config);
         publish_mqtt_discovery();
         request_ui_refresh();
     } else if (event->event_id == MQTT_EVENT_DISCONNECTED) {
@@ -833,7 +900,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         for (int b = 0; b < s_config.num_banks; b++) {
             for (int i = 0; i < MAIN_BTN_COUNT; i++) {
                 char expected_topic[80];
-                build_mqtt_topic(expected_topic, sizeof(expected_topic), s_config.banks[b].buttons[i].mqtt_topic, "state");
+                build_panel_mqtt_topic(expected_topic, sizeof(expected_topic), s_config.banks[b].buttons[i].entity_id, "state");
 
                 if (strcmp(topic, expected_topic) == 0) {
                     s_btn_states[b][i] = new_state;
@@ -889,7 +956,7 @@ static void publish_mqtt_command(uint8_t bank, uint8_t btn, bool state) {
     if (!s_mqtt_client || !s_mqtt_connected) return; // Fail gracefully if not connected
     
     char pub_topic[80];
-    build_mqtt_topic(pub_topic, sizeof(pub_topic), s_config.banks[bank].buttons[btn].mqtt_topic, "command");
+    build_panel_mqtt_topic(pub_topic, sizeof(pub_topic), s_config.banks[bank].buttons[btn].entity_id, "command");
     const char *payload = state ? "ON" : "OFF";
     
     // Publish with QoS 1
@@ -1108,7 +1175,7 @@ static void load_default_config(void)
         snprintf(s_config.banks[0].buttons[i].display_name, 17, "Scene %d", i+1);
         
         // ADD THIS: Give the button a default MQTT topic!
-        snprintf(s_config.banks[0].buttons[i].mqtt_topic, 64, "sanctuary/worship/scene%d", i+1); 
+        snprintf(s_config.banks[0].buttons[i].entity_id, 64, "sanctuary/worship/scene%d", i+1); 
         
         s_config.banks[0].buttons[i].type = BTN_TYPE_RADIO;
         s_config.banks[0].buttons[i].radio_group = 1;
@@ -1127,7 +1194,7 @@ static void load_default_config(void)
         snprintf(s_config.banks[1].buttons[i].display_name, 17, "Zone %d", i+1);
         
         // ADD THIS: Give the button a default MQTT topic!
-        snprintf(s_config.banks[1].buttons[i].mqtt_topic, 64, "sanctuary/house/zone%d", i+1);
+        snprintf(s_config.banks[1].buttons[i].entity_id, 64, "sanctuary/house/zone%d", i+1);
         
         s_config.banks[1].buttons[i].type = BTN_TYPE_TOGGLE;
         
@@ -1597,7 +1664,8 @@ static esp_err_t api_get_config_handler(httpd_req_t *req)
         for (int i = 0; i < MAIN_BTN_COUNT; ++i) {
             cJSON *btn = cJSON_CreateObject();
             cJSON_AddStringToObject(btn, "display_name", s_config.banks[b].buttons[i].display_name);
-            cJSON_AddStringToObject(btn, "mqtt_topic", s_config.banks[b].buttons[i].mqtt_topic);
+            cJSON_AddStringToObject(btn, "entity_id", s_config.banks[b].buttons[i].entity_id);
+            cJSON_AddStringToObject(btn, "mqtt_topic", s_config.banks[b].buttons[i].entity_id);
             cJSON_AddNumberToObject(btn, "type", s_config.banks[b].buttons[i].type);
             cJSON_AddNumberToObject(btn, "radio_group", s_config.banks[b].buttons[i].radio_group);
 
@@ -1632,6 +1700,11 @@ static esp_err_t api_post_config_handler(httpd_req_t *req)
 {
     int content_len = req->content_len;
     if (content_len <= 0 || content_len > 8192) return ESP_FAIL;
+
+    static system_config_t prev_config;
+    mqtt_config_t prev_mqtt = s_mqtt_config;
+    app_wifi_config_t prev_wifi = s_wifi_config;
+    prev_config = s_config;
 
     char *buf = malloc(content_len + 1);
     if (!buf) return ESP_FAIL;
@@ -1702,11 +1775,14 @@ static esp_err_t api_post_config_handler(httpd_req_t *req)
                 cJSON_ArrayForEach(bitem, buttons) {
                     if (bi >= MAIN_BTN_COUNT) break;
                     cJSON *d = cJSON_GetObjectItemCaseSensitive(bitem, "display_name");
-                    cJSON *mt = cJSON_GetObjectItemCaseSensitive(bitem, "mqtt_topic");
+                    cJSON *mt = cJSON_GetObjectItemCaseSensitive(bitem, "entity_id");
+                    if (!cJSON_IsString(mt) || !mt->valuestring) {
+                        mt = cJSON_GetObjectItemCaseSensitive(bitem, "mqtt_topic");
+                    }
                     cJSON *tp = cJSON_GetObjectItemCaseSensitive(bitem, "type");
                     cJSON *rg = cJSON_GetObjectItemCaseSensitive(bitem, "radio_group");
                     if (cJSON_IsString(d) && d->valuestring) snprintf(s_config.banks[bidx].buttons[bi].display_name, sizeof(s_config.banks[bidx].buttons[bi].display_name), "%s", d->valuestring);
-                    if (cJSON_IsString(mt) && mt->valuestring) snprintf(s_config.banks[bidx].buttons[bi].mqtt_topic, sizeof(s_config.banks[bidx].buttons[bi].mqtt_topic), "%s", mt->valuestring);
+                    if (cJSON_IsString(mt) && mt->valuestring) snprintf(s_config.banks[bidx].buttons[bi].entity_id, sizeof(s_config.banks[bidx].buttons[bi].entity_id), "%s", mt->valuestring);
                     if (cJSON_IsNumber(tp)) s_config.banks[bidx].buttons[bi].type = (btn_type_t)tp->valueint;
                     if (cJSON_IsNumber(rg)) s_config.banks[bidx].buttons[bi].radio_group = (uint8_t)rg->valueint;
 
@@ -1725,11 +1801,16 @@ static esp_err_t api_post_config_handler(httpd_req_t *req)
 
     sanitize_config();
 
-    mqtt_config_t prev_mqtt = s_mqtt_config;
-    app_wifi_config_t prev_wifi = s_wifi_config;
-
     /* Persist changes. Only touch network state if those settings changed. */
     save_full_config_nvs();
+
+    if (s_mqtt_connected) {
+        for (int b = 0; b < MAX_BANKS; ++b) {
+            for (int i = 0; i < MAIN_BTN_COUNT; ++i) {
+                clear_button_discovery_by_entity_id(prev_config.banks[b].buttons[i].entity_id);
+            }
+        }
+    }
 
     bool mqtt_changed = !mqtt_config_equal(&prev_mqtt, &s_mqtt_config);
     bool wifi_changed = !wifi_config_equal(&prev_wifi, &s_wifi_config);
@@ -1743,7 +1824,9 @@ static esp_err_t api_post_config_handler(httpd_req_t *req)
         }
     }
 
-    if (s_mqtt_connected) {
+    if (s_mqtt_connected && !mqtt_changed && !wifi_changed) {
+        unsubscribe_all_state_topics(&prev_config);
+        subscribe_all_state_topics(&s_config);
         publish_mqtt_discovery();
     }
 

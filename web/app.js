@@ -27,7 +27,7 @@ async function initDashboard(){
       bd.className = 'bank-section';
       bd.innerHTML = `<h3>Bank ${idx+1}: ${b.bank_name}</h3><div class="button-list">`;
       b.buttons.forEach((btn,i)=> {
-        bd.querySelector('.button-list').innerHTML += `<div class="button-item"><strong>${i+1}. ${btn.display_name}</strong>${btn.mqtt_topic}</div>`;
+        bd.querySelector('.button-list').innerHTML += `<div class="button-item"><strong>${i+1}. ${btn.display_name}</strong>${btn.entity_id || btn.mqtt_topic || ''}</div>`;
       });
       bd.querySelector('.button-list').innerHTML += '</div>';
       banksDiv.appendChild(bd);

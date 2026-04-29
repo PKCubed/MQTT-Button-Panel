@@ -157,8 +157,8 @@
                   <button class="btn-small paste-btn" title="Paste button">Paste</button>
               </div>
               <div class="form-group">
-                <label>MQTT Topic</label>
-                <input type="text" class="btn-topic" placeholder="e.g., scene/zone/state" maxlength="63" value="${btn.mqtt_topic || ''}">
+                <label>HA Entity ID</label>
+                <input type="text" class="btn-topic" placeholder="e.g., sanctuary_systems_on" maxlength="63" value="${btn.entity_id || btn.mqtt_topic || ''}">
               </div>
               <div class="form-group">
                 <label>Button Type</label>
@@ -474,7 +474,7 @@
         
         bankDiv.querySelectorAll('.button-card').forEach((btnDiv, i) => {
           cfg.banks[b].buttons[i].display_name = btnDiv.querySelector('.btn-name').value;
-          cfg.banks[b].buttons[i].mqtt_topic = btnDiv.querySelector('.btn-topic').value;
+          cfg.banks[b].buttons[i].entity_id = btnDiv.querySelector('.btn-topic').value;
           cfg.banks[b].buttons[i].type = parseInt(btnDiv.querySelector('.btn-type').value);
           cfg.banks[b].buttons[i].radio_group = parseInt(btnDiv.querySelector('.btn-radio-group').value);
           
@@ -515,7 +515,7 @@
       for (let i = 0; i < 4; i++) {
         bank.buttons.push({
           display_name: `Btn ${i+1}`,
-          mqtt_topic: `panel/bank${index}/btn${i+1}`,
+          entity_id: `bank${index}_btn${i+1}`,
           type: 0,
           radio_group: 0,
           color_on: [0,255,0],
@@ -526,9 +526,10 @@
     }
 
     function collectButtonCard(card) {
+      const entityId = card.querySelector('.btn-topic').value;
       return {
         display_name: card.querySelector('.btn-name').value,
-        mqtt_topic: card.querySelector('.btn-topic').value,
+        entity_id: entityId,
         type: parseInt(card.querySelector('.btn-type').value),
         radio_group: parseInt(card.querySelector('.btn-radio-group')?.value || 0),
         color_on: hexToRgb(card.querySelector('.btn-color-on').value),
@@ -558,7 +559,7 @@
 
     function applyButtonCard(card, data) {
       card.querySelector('.btn-name').value = data.display_name || '';
-      card.querySelector('.btn-topic').value = data.mqtt_topic || '';
+      card.querySelector('.btn-topic').value = data.entity_id || data.mqtt_topic || '';
       card.querySelector('.btn-type').value = String(data.type || 0);
       const rg = card.querySelector('.btn-radio-group'); 
       if (rg) rg.value = data.radio_group || 0;

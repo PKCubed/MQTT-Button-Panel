@@ -1,0 +1,77 @@
+# File: automations/panels_command_router.yaml
+#
+# Home Assistant automation that routes button panel commands to HA entities.
+# 
+# This automation listens on MQTT topic "panels/+/command" for button panel
+# commands (ON, OFF, TOGGLE) and routes them to corresponding switch entities
+# in Home Assistant. After performing the action, it publishes a retained state
+# back to "panels/<panel_id>/state" so all connected panels stay in sync with HA.
+#
+# Panel Configuration:
+# - Each button in the panel editor sets an "HA Entity ID" (e.g., "switch.desk_light")
+# - The panel publishes button presses to "panels/<entity_id>/command" with payload ON/OFF/TOGGLE
+# - This automation intercepts that command and executes it in HA
+# - The resulting state is published back to "panels/<entity_id>/state" (retained)
+# - All panels receive the state update and reflect the canonical HA state
+
+alias: MQTT Panel Command Router
+description: Route button panel commands to HA entities and publish state back
+
+trigger:
+  - platform: mqtt
+    topic: panels/+/command
+
+condition: []
+
+action:
+  - variables:
+      # Extract the panel entity ID from the topic (e.g. "desk-light" from "panels/desk-light/command")
+      panel_id: "{{ trigger.topic.split('/')[1] }}"
+      command: "{{ trigger.payload | upper }}"
+      # Build the target switch entity name from the panel ID
+      # Replace hyphens with underscores and prepend "switch."
+      # Example: "desk-light" → "switch.desk_light"
+      target_entity: "switch.{{ panel_id.replace('-', '_') }}"
+
+  # Only proceed if command is one of: ON, OFF, TOGGLE
+  - choose:
+      - conditions:
+          - condition: template
+            value_template: "{{ command in ['ON', 'OFF', 'TOGGLE'] }}"
+        sequence:
+          # Determine the new state based on command
+          - variables:
+              new_state: |-
+                {%- if command == 'TOGGLE' -%}
+                  {%- if is_state(target_entity, 'on') -%}OFF{%- else -%}ON{%- endif -%}
+                {%- else -%}
+                  {{ command }}
+                {%- endif -%}
+          
+          # Call the appropriate service to execute the command in HA
+          - if:
+              - condition: template
+                value_template: "{{ new_state == 'ON' }}"
+            then:
+              - service: switch.turn_on
+                target:
+                  entity_id: "{{ target_entity }}"
+              # Publish the ON state back to the panel (retained)
+              - service: mqtt.publish
+                data:
+                  topic: "panels/{{ panel_id }}/state"
+                  payload: "ON"
+                  retain: true
+            else:
+              - service: switch.turn_off
+                target:
+                  entity_id: "{{ target_entity }}"
+              # Publish the OFF state back to the panel (retained)
+              - service: mqtt.publish
+                data:
+                  topic: "panels/{{ panel_id }}/state"
+                  payload: "OFF"
+                  retain: true
+
+mode: parallel
+max_exceeded: silent
