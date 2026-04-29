@@ -155,6 +155,10 @@ static system_config_t s_config;
 static uint8_t s_current_bank = 0;
 static bool s_btn_states[MAX_BANKS][MAIN_BTN_COUNT] = {false}; // Logical states (ON/OFF)
 static bool s_in_menu = false;
+static int s_menu_index = 0;
+static const char *s_menu_items[] = { "Panel", "WiFi", "MQTT", "Save" };
+static const int s_menu_items_count = sizeof(s_menu_items) / sizeof(s_menu_items[0]);
+static const char *s_menu_button_funcs[] = { "Select", "Action", "Save", "Extra" };
 static bool s_mqtt_connected = false;
 /* Startup animation keeps running until boot is fully complete.              */
 static bool s_startup_complete = false;
@@ -974,24 +978,34 @@ static void net_event_handler(void *arg, esp_event_base_t event_base, int32_t ev
             case ETHERNET_EVENT_CONNECTED:
                 ESP_LOGI(TAG, "Ethernet Link Up");
                 s_eth_connected = true;
-                s_wifi_connected = false;
-                // Stop Wi-Fi to save power when ETH is available
-                esp_wifi_stop();
                 break;
             case ETHERNET_EVENT_DISCONNECTED:
                 ESP_LOGI(TAG, "Ethernet Link Down - Starting Wi-Fi Fallback");
                 s_eth_connected = false;
-                s_eth_has_ip = false;
-                // Start WiFi as fallback
-                esp_wifi_start();
-                vTaskDelay(pdMS_TO_TICKS(100)); // Brief delay for WiFi to stabilize
-                esp_wifi_connect();
+                if (s_eth_has_ip) {
+                    // Ethernet was actively serving traffic; fall back to Wi-Fi now.
+                    s_eth_has_ip = false;
+                    esp_err_t start_err = esp_wifi_start();
+                    if (start_err != ESP_OK && start_err != ESP_ERR_WIFI_CONN) {
+                        ESP_LOGW(TAG, "esp_wifi_start fallback failed: %s", esp_err_to_name(start_err));
+                    }
+                    esp_err_t conn_err = esp_wifi_connect();
+                    if (conn_err != ESP_OK) {
+                        ESP_LOGW(TAG, "esp_wifi_connect fallback failed: %s", esp_err_to_name(conn_err));
+                    }
+                }
                 break;
         }
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_ETH_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *) event_data;
         ESP_LOGI(TAG, "ETH Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
         s_eth_has_ip = true;
+        s_wifi_connected = false;
+        // Prefer Ethernet only after it has a usable IP.
+        esp_err_t stop_err = esp_wifi_stop();
+        if (stop_err != ESP_OK && stop_err != ESP_ERR_WIFI_NOT_INIT && stop_err != ESP_ERR_WIFI_NOT_STARTED) {
+            ESP_LOGW(TAG, "esp_wifi_stop after ETH IP failed: %s", esp_err_to_name(stop_err));
+        }
         start_mqtt();
     } else if (event_base == WIFI_EVENT) {
         switch (event_id) {
@@ -1002,11 +1016,19 @@ static void net_event_handler(void *arg, esp_event_base_t event_base, int32_t ev
                 ESP_LOGI(TAG, "Wi-Fi connected to AP");
                 break;
             case WIFI_EVENT_STA_DISCONNECTED:
-                // Only auto-retry if Ethernet is not connected
-                if (!s_eth_connected) {
+                {
+                    wifi_event_sta_disconnected_t *disc = (wifi_event_sta_disconnected_t *)event_data;
+                    if (disc != NULL) {
+                        ESP_LOGW(TAG, "Wi-Fi disconnected, reason=%d", disc->reason);
+                    }
+                }
+                // Only auto-retry if Ethernet is not actively providing IP.
+                if (!s_eth_has_ip) {
                     ESP_LOGI(TAG, "Wi-Fi Disconnected, retrying...");
-                    vTaskDelay(pdMS_TO_TICKS(500));
-                    esp_wifi_connect();
+                    esp_err_t conn_err = esp_wifi_connect();
+                    if (conn_err != ESP_OK) {
+                        ESP_LOGW(TAG, "esp_wifi_connect retry failed: %s", esp_err_to_name(conn_err));
+                    }
                 }
                 s_wifi_connected = false;
                 break;
@@ -1085,6 +1107,8 @@ wifi_only:
     
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_config));
+    // Keep Wi-Fi fully awake for stable always-on panel connectivity.
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
     
     // Apply static IP settings if not using DHCP
     esp_netif_t *wifi_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
@@ -1258,8 +1282,12 @@ static void update_system_ui(int touch_preview_idx)
 
     // --- LCD Updates ---
     if (s_in_menu) {
-        snprintf(line1, sizeof(line1), "--- MENU ---");
-        snprintf(line2, sizeof(line2), "Settings..."); 
+        snprintf(line1, sizeof(line1), "Menu: %d. %s", s_menu_index + 1, s_menu_items[s_menu_index]);
+        if (touch_preview_idx >= 0 && touch_preview_idx < MAIN_BTN_COUNT) {
+            snprintf(line2, sizeof(line2), "%s", s_menu_button_funcs[touch_preview_idx]);
+        } else {
+            line2[0] = '\0';
+        }
     } else if (touch_preview_idx >= 0 && touch_preview_idx < MAIN_BTN_COUNT) {
         snprintf(line1, sizeof(line1), "%s", s_config.banks[s_current_bank].bank_name);
         button_config_t *btn = &s_config.banks[s_current_bank].buttons[touch_preview_idx];
@@ -1277,38 +1305,73 @@ static void update_system_ui(int touch_preview_idx)
     // --- LED Updates ---
     uint8_t rgb[LED_COUNT][3] = {0};
 
-    if (s_mqtt_connected) {
-        for (int i = 0; i < MAIN_BTN_COUNT; i++) {
-            button_config_t *btn_cfg = &s_config.banks[s_current_bank].buttons[i];
-            bool is_on = s_btn_states[s_current_bank][i];
+    if (s_in_menu) {
+        // Menu mode: color the four main buttons to indicate actions
+        const uint8_t menu_colors[MAIN_BTN_COUNT][3] = {
+            {0, 255, 0},    // Button 0: Select (green)
+            {255, 255, 0},  // Button 1: Back (yellow)
+            {0, 0, 255},    // Button 2: Save/Action (blue)
+            {255, 0, 255}   // Button 3: Extra (magenta)
+        };
 
-            if (is_on) {
-                memcpy(rgb[i], btn_cfg->color_on, 3);
-            } else {
-                memcpy(rgb[i], btn_cfg->color_off, 3);
+        for (int i = 0; i < MAIN_BTN_COUNT; i++) {
+            rgb[i][0] = menu_colors[i][0];
+            rgb[i][1] = menu_colors[i][1];
+            rgb[i][2] = menu_colors[i][2];
+            // Highlight selected item
+            if (i == s_menu_index) {
+                int r0 = rgb[i][0] * 2;
+                int r1 = rgb[i][1] * 2;
+                int r2 = rgb[i][2] * 2;
+                rgb[i][0] = (uint8_t)(r0 > 255 ? 255 : r0);
+                rgb[i][1] = (uint8_t)(r1 > 255 ? 255 : r1);
+                rgb[i][2] = (uint8_t)(r2 > 255 ? 255 : r2);
             }
         }
 
-        // The bank buttons are navigation controls, so we keep them visible.
-        // They turn red while held to make the press feel immediate.
+        // Bank buttons: red while held, dim otherwise
         if (s_bank_btns_held[0]) {
             rgb[BTN_BANK_DOWN][0] = 255; rgb[BTN_BANK_DOWN][1] = 0; rgb[BTN_BANK_DOWN][2] = 0;
         } else {
             rgb[BTN_BANK_DOWN][0] = 48; rgb[BTN_BANK_DOWN][1] = 48; rgb[BTN_BANK_DOWN][2] = 48;
         }
-
         if (s_bank_btns_held[1]) {
             rgb[BTN_BANK_UP][0] = 255; rgb[BTN_BANK_UP][1] = 0; rgb[BTN_BANK_UP][2] = 0;
         } else {
             rgb[BTN_BANK_UP][0] = 48; rgb[BTN_BANK_UP][1] = 48; rgb[BTN_BANK_UP][2] = 48;
         }
-    } else if (s_bank_btns_held[0] || s_bank_btns_held[1]) {
-        // Even if MQTT is offline, still reflect the physical press state.
-        if (s_bank_btns_held[0]) {
-            rgb[BTN_BANK_DOWN][0] = 255; rgb[BTN_BANK_DOWN][1] = 0; rgb[BTN_BANK_DOWN][2] = 0;
-        }
-        if (s_bank_btns_held[1]) {
-            rgb[BTN_BANK_UP][0] = 255; rgb[BTN_BANK_UP][1] = 0; rgb[BTN_BANK_UP][2] = 0;
+    } else {
+        if (s_mqtt_connected) {
+            for (int i = 0; i < MAIN_BTN_COUNT; i++) {
+                button_config_t *btn_cfg = &s_config.banks[s_current_bank].buttons[i];
+                bool is_on = s_btn_states[s_current_bank][i];
+
+                if (is_on) {
+                    memcpy(rgb[i], btn_cfg->color_on, 3);
+                } else {
+                    memcpy(rgb[i], btn_cfg->color_off, 3);
+                }
+            }
+
+            // Bank buttons visual feedback
+            if (s_bank_btns_held[0]) {
+                rgb[BTN_BANK_DOWN][0] = 255; rgb[BTN_BANK_DOWN][1] = 0; rgb[BTN_BANK_DOWN][2] = 0;
+            } else {
+                rgb[BTN_BANK_DOWN][0] = 48; rgb[BTN_BANK_DOWN][1] = 48; rgb[BTN_BANK_DOWN][2] = 48;
+            }
+            if (s_bank_btns_held[1]) {
+                rgb[BTN_BANK_UP][0] = 255; rgb[BTN_BANK_UP][1] = 0; rgb[BTN_BANK_UP][2] = 0;
+            } else {
+                rgb[BTN_BANK_UP][0] = 48; rgb[BTN_BANK_UP][1] = 48; rgb[BTN_BANK_UP][2] = 48;
+            }
+        } else if (s_bank_btns_held[0] || s_bank_btns_held[1]) {
+            // Even if MQTT is offline, reflect the physical press state.
+            if (s_bank_btns_held[0]) {
+                rgb[BTN_BANK_DOWN][0] = 255; rgb[BTN_BANK_DOWN][1] = 0; rgb[BTN_BANK_DOWN][2] = 0;
+            }
+            if (s_bank_btns_held[1]) {
+                rgb[BTN_BANK_UP][0] = 255; rgb[BTN_BANK_UP][1] = 0; rgb[BTN_BANK_UP][2] = 0;
+            }
         }
     }
 
@@ -1341,6 +1404,9 @@ static void refresh_touch_preview(int *current_touch_preview, bool touch_active[
 
 /* Main state machine. This task receives all input events, mutates logical    */
 /* button state, manages bank changes, and triggers UI refreshes.             */
+/* forward declaration used by menu select action */
+static void save_full_config_nvs(void);
+
 static void logic_task(void *arg)
 {
     input_event_t evt;
@@ -1348,7 +1414,7 @@ static void logic_task(void *arg)
     bool touch_active[MAIN_BTN_COUNT] = {false};
     uint32_t touch_order[MAIN_BTN_COUNT] = {0};
     uint32_t touch_seq = 0;
-    int64_t menu_timer_start = 0;
+    (void)0; // placeholder (menu toggles immediately on simultaneous bank press)
 
     update_system_ui(-1);
 
@@ -1362,14 +1428,27 @@ static void logic_task(void *arg)
             if (evt.btn_idx == BTN_BANK_DOWN || evt.btn_idx == BTN_BANK_UP) {
                 if (evt.type == EVT_BTN_PRESSED) {
                     s_bank_btns_held[evt.btn_idx - BTN_BANK_DOWN] = true;
+                    // If both bank buttons are pressed simultaneously, toggle menu immediately
                     if (s_bank_btns_held[0] && s_bank_btns_held[1]) {
-                        menu_timer_start = now_ms();
+                        s_in_menu = !s_in_menu;
+                        // Reset menu cursor when opening
+                        if (s_in_menu) s_menu_index = 0;
+                        update_system_ui(current_touch_preview);
+                    } else {
+                        // If we're in the menu, single bank presses navigate up/down
+                        if (s_in_menu) {
+                            if (evt.btn_idx == BTN_BANK_UP) {
+                                if (s_menu_index < s_menu_items_count - 1) s_menu_index++;
+                            } else if (evt.btn_idx == BTN_BANK_DOWN) {
+                                if (s_menu_index > 0) s_menu_index--;
+                            }
+                        }
+                        update_system_ui(current_touch_preview);
                     }
-                    update_system_ui(current_touch_preview);
                 } else if (evt.type == EVT_BTN_RELEASED) {
                     s_bank_btns_held[evt.btn_idx - BTN_BANK_DOWN] = false;
-                    menu_timer_start = 0;
 
+                    // Only change banks when not in menu mode
                     if (!s_in_menu) {
                         if (evt.btn_idx == BTN_BANK_UP && s_current_bank < s_config.num_banks - 1) s_current_bank++;
                         if (evt.btn_idx == BTN_BANK_DOWN && s_current_bank > 0) s_current_bank--;
@@ -1392,11 +1471,37 @@ static void logic_task(void *arg)
             }
 
             if (evt.btn_idx < MAIN_BTN_COUNT) {
-                // Button 3 exits the menu when the menu is open.
                 if (s_in_menu) {
-                    if (evt.type == EVT_BTN_PRESSED && evt.btn_idx == 3) {
-                        s_in_menu = false;
-                        update_system_ui(-1);
+                    if (evt.type == EVT_BTN_PRESSED) {
+                        // In-menu main buttons mapping:
+                        // 0 = Select/Enter, 1 = Action (secondary), 2 = Save, 3 = Extra
+                        switch (evt.btn_idx) {
+                            case 0: // Select/Enter
+                                if (strcmp(s_menu_items[s_menu_index], "Save") == 0) {
+                                    save_full_config_nvs();
+                                } else {
+                                    // Placeholder: toggle a simple ack on LCD for non-save items
+                                    char ack[17];
+                                    snprintf(ack, sizeof(ack), "Selected: %s", s_menu_items[s_menu_index]);
+                                    lcd_set_lines("--- MENU ---", ack);
+                                    vTaskDelay(pdMS_TO_TICKS(600));
+                                }
+                                break;
+                            case 1: // Secondary action (no-op for now)
+                                lcd_set_lines("--- MENU ---", "Action OK");
+                                vTaskDelay(pdMS_TO_TICKS(300));
+                                break;
+                            case 2: // Save
+                                save_full_config_nvs();
+                                lcd_set_lines("--- MENU ---", "Saved");
+                                vTaskDelay(pdMS_TO_TICKS(400));
+                                break;
+                            case 3: // Extra (reserved)
+                                lcd_set_lines("--- MENU ---", "Reserved");
+                                vTaskDelay(pdMS_TO_TICKS(300));
+                                break;
+                        }
+                        update_system_ui(current_touch_preview);
                     }
                 } else {
                     button_config_t *cfg = &s_config.banks[s_current_bank].buttons[evt.btn_idx];
@@ -1431,11 +1536,7 @@ static void logic_task(void *arg)
             }
         }
 
-        if (menu_timer_start > 0 && (now_ms() - menu_timer_start > 2000)) {
-            s_in_menu = !s_in_menu;
-            menu_timer_start = 0; 
-            update_system_ui(current_touch_preview);
-        }
+        (void)0;
     }
 }
 
