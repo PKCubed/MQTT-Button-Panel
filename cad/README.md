@@ -1,6 +1,9 @@
+
 # Printing Instructions
 
 ## Buttons
+
+<img width="1086" height="1045" alt="Screenshot 2026-04-30 080520" src="https://github.com/user-attachments/assets/cae41648-d123-4df7-9fbe-8dd1b1e2b63c" />
 
 * ### Transparent Part
 
