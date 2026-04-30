@@ -398,7 +398,8 @@ static void publish_button_discovery(uint8_t bank, uint8_t btn)
      /* Advertise a UI command topic that HA will publish to when toggled in the
          UI. Panels and the automation ignore this topic; the automation listens
          only to the canonical "command" topic published by panels. */
-     cJSON_AddStringToObject(root, "command_topic", ui_command_topic);
+     //cJSON_AddStringToObject(root, "command_topic", ui_command_topic);
+     cJSON_AddStringToObject(root, "command_topic", state_topic);
      cJSON_AddStringToObject(root, "state_topic", state_topic);
      cJSON_AddStringToObject(root, "payload_on", "ON");
      cJSON_AddStringToObject(root, "payload_off", "OFF");
