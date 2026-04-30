@@ -73,5 +73,5 @@ action:
                   payload: "OFF"
                   retain: true
 
-mode: parallel
+mode: queued
 max_exceeded: silent

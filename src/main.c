@@ -377,25 +377,31 @@ static void publish_button_discovery(uint8_t bank, uint8_t btn)
     snprintf(unique_id, sizeof(unique_id), "%s", topic_id);
     snprintf(discovery_topic, sizeof(discovery_topic), "homeassistant/switch/%s/config", topic_id);
 
-    char state_topic[96];
-    char command_topic[96];
-    build_panel_mqtt_topic(state_topic, sizeof(state_topic), cfg->entity_id, "state");
-    build_panel_mqtt_topic(command_topic, sizeof(command_topic), cfg->entity_id, "command");
+     char state_topic[96];
+     char command_topic[96];
+     char ui_command_topic[96];
+     build_panel_mqtt_topic(state_topic, sizeof(state_topic), cfg->entity_id, "state");
+     build_panel_mqtt_topic(command_topic, sizeof(command_topic), cfg->entity_id, "command");
+     /* Advertise a harmless UI command topic so Home Assistant accepts the discovery
+         but ensure it won't be used by panels or the automation. This prevents HA
+         from publishing to the real "command" topic that panels use. */
+     build_panel_mqtt_topic(ui_command_topic, sizeof(ui_command_topic), cfg->entity_id, "ui_command");
 
     cJSON *root = cJSON_CreateObject();
     if (!root) {
         return;
     }
 
-    cJSON_AddStringToObject(root, "name", cfg->display_name[0] ? cfg->display_name : topic_id);
-    cJSON_AddStringToObject(root, "unique_id", unique_id);
-    cJSON_AddStringToObject(root, "object_id", topic_id);
-    cJSON_AddStringToObject(root, "command_topic", command_topic);
-    cJSON_AddStringToObject(root, "state_topic", state_topic);
-    cJSON_AddStringToObject(root, "payload_on", "ON");
-    cJSON_AddStringToObject(root, "payload_off", "OFF");
-    cJSON_AddStringToObject(root, "payload_press", "ON");
-    cJSON_AddStringToObject(root, "payload_release", "OFF");
+     cJSON_AddStringToObject(root, "name", cfg->display_name[0] ? cfg->display_name : topic_id);
+     cJSON_AddStringToObject(root, "unique_id", unique_id);
+     cJSON_AddStringToObject(root, "object_id", topic_id);
+     /* Advertise a UI command topic that HA will publish to when toggled in the
+         UI. Panels and the automation ignore this topic; the automation listens
+         only to the canonical "command" topic published by panels. */
+     cJSON_AddStringToObject(root, "command_topic", ui_command_topic);
+     cJSON_AddStringToObject(root, "state_topic", state_topic);
+     cJSON_AddStringToObject(root, "payload_on", "ON");
+     cJSON_AddStringToObject(root, "payload_off", "OFF");
 
     char *payload = cJSON_PrintUnformatted(root);
     if (payload != NULL) {
@@ -907,6 +913,8 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                 build_panel_mqtt_topic(expected_topic, sizeof(expected_topic), s_config.banks[b].buttons[i].entity_id, "state");
 
                 if (strcmp(topic, expected_topic) == 0) {
+                    ESP_LOGI(TAG, "  -> Matched button bank=%d idx=%d, state changing from %s to %s", 
+                             b, i, s_btn_states[b][i] ? "ON" : "OFF", new_state ? "ON" : "OFF");
                     s_btn_states[b][i] = new_state;
 
                     // Only force a UI update if the changed button is on the currently visible bank
@@ -1516,14 +1524,27 @@ static void logic_task(void *arg)
                             // Momentary: send ON on press.
                             publish_mqtt_command(s_current_bank, evt.btn_idx, true);
                         } else if (cfg->type == BTN_TYPE_RADIO) {
-                            // Radio: request all peers in the group be turned off,
-                            // then request this button be turned on.
-                            for (int i = 0; i < MAIN_BTN_COUNT; i++) {
-                                if (s_config.banks[s_current_bank].buttons[i].radio_group == cfg->radio_group) {
-                                    publish_mqtt_command(s_current_bank, i, false);
+                            // Radio: if this button is already active, don't resend a conflicting OFF/ON pair.
+                            ESP_LOGI(TAG, "RADIO PRESS: bank=%d btn=%d (group=%d), current_state=%s", 
+                                     s_current_bank, evt.btn_idx, cfg->radio_group, (*state) ? "ON" : "OFF");
+                            ESP_LOGI(TAG, "  Group state: [0]=%s [1]=%s [2]=%s [3]=%s",
+                                     s_btn_states[s_current_bank][0] ? "ON" : "OFF",
+                                     s_btn_states[s_current_bank][1] ? "ON" : "OFF",
+                                     s_btn_states[s_current_bank][2] ? "ON" : "OFF",
+                                     s_btn_states[s_current_bank][3] ? "ON" : "OFF");
+                            if (!(*state)) {
+                                // Turn off the other buttons in the group, then request this one ON.
+                                for (int i = 0; i < MAIN_BTN_COUNT; i++) {
+                                    if (i != evt.btn_idx && s_config.banks[s_current_bank].buttons[i].radio_group == cfg->radio_group) {
+                                        ESP_LOGI(TAG, "  -> Sending OFF to btn %d (group member)", i);
+                                        publish_mqtt_command(s_current_bank, i, false);
+                                    }
                                 }
+                                ESP_LOGI(TAG, "  -> Sending ON to btn %d (pressed button)", evt.btn_idx);
+                                publish_mqtt_command(s_current_bank, evt.btn_idx, true);
+                            } else {
+                                ESP_LOGI(TAG, "  -> Button already ON, skipping command");
                             }
-                            publish_mqtt_command(s_current_bank, evt.btn_idx, true);
                         }
                     } else if (evt.type == EVT_BTN_RELEASED) {
                         if (cfg->type == BTN_TYPE_MOMENTARY) {
