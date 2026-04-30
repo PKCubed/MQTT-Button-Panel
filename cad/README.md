@@ -4,6 +4,9 @@
 
 * ### Transparent Part
 
+<img width="1935" height="1453" alt="PXL_20260430_143414308 RAW-01 MP COVER" src="https://github.com/user-attachments/assets/97fd2d80-9e74-4fba-9ccb-364fc2fbc838" />
+
+\
 Set infill to solid (100% density) and choose a pattern you like. Concentric infill gives a nice transparency. Choosing the largest layer height seems to give the best transparency. Below are the settings I used:
 | Setting | Value |
 | :--- | :--- |
