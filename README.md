@@ -2,6 +2,8 @@
 
 A panel of four, customizable, RGB-backlit buttons designed for use with Home Assistant and communication over MQTT via WiFi and Ethernet.
 
+<img width="4624" height="3472" alt="PXL_20260501_205123144 RAW-01 MP COVER" src="https://github.com/user-attachments/assets/71067a1c-6f09-4ba7-a5da-018eb472e060" />
+
 ## Hardware
 
 This design is centered around a WT32-ETH01 development board. This is an ESP32 with a LAN8720 Ethernet transceiver allowing for both WiFi and Ethernet connectivity.
