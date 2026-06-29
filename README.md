@@ -13,7 +13,7 @@ A panel of four, customizable, RGB-backlit buttons designed for use with Home As
   - Configure buttons with entity IDs
 - Add button panel to HA
 - Create automations to control systems with the button panel entities
-  - Use [this blueprint](PKCubed/link_switches_and_lights.yaml) to link the button panel entities to switches
+  - Use [this blueprint](https://gist.github.com/PKCubed/5fed5823f06fd57056f4231d421e1b52) to link the button panel entities to switches
 
 ## Hardware
 
