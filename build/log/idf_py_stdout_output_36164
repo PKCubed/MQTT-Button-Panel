@@ -1,0 +1,10 @@
+Command: cmake -G Ninja -DPYTHON_DEPS_CHECKED=1 -DPYTHON=C:\Users\peter\.espressif\python_env\idf5.5_py3.11_env\Scripts\python.exe -DESP_PLATFORM=1 -DCCACHE_ENABLE=0 C:\Users\peter\Documents\GitHub\MQTT-Button-Panel
+-- IDF_TARGET is not set, guessed 'esp32' from sdkconfig 'C:/Users/peter/Documents/GitHub/MQTT-Button-Panel/sdkconfig'
+-- Found Git: C:/Program Files/Git/cmd/git.exe (found version "2.49.0.windows.1")
+-- Minimal build - OFF
+-- The C compiler identification is unknown
+-- The CXX compiler identification is unknown
+-- The ASM compiler identification is unknown
+-- Found assembler: xtensa-esp32-elf-gcc
+-- Warning: Did not find file Compiler/-ASM
+-- Configuring incomplete, errors occurred!
