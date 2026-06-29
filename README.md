@@ -4,6 +4,17 @@ A panel of four, customizable, RGB-backlit buttons designed for use with Home As
 
 <img width="4624" height="3472" alt="PXL_20260501_205123144 RAW-01 MP COVER" src="https://github.com/user-attachments/assets/71067a1c-6f09-4ba7-a5da-018eb472e060" />
 
+# Setup Steps (Work in Progress)
+- Setup MQTT broker
+- Add command router automation to HA
+- Configure a button panel with its web interface
+  - Find it's IP address by entering the menu (pressing both small buttons at the same time)
+  - Set the MQTT broker IP address
+  - Configure buttons with entity IDs
+- Add button panel to HA
+- Create automations to control systems with the button panel entities
+  - Use [this blueprint](PKCubed/link_switches_and_lights.yaml) to link the button panel entities to switches
+
 ## Hardware
 
 This design is centered around a WT32-ETH01 development board. This is an ESP32 with a LAN8720 Ethernet transceiver allowing for both WiFi and Ethernet connectivity.
